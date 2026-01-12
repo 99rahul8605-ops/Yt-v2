@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime
 from aiohttp import web
-import threading
 
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
@@ -34,7 +33,6 @@ class YouTubeDownloaderBot:
         self.cookies_available = False
         self.cookies_metadata = {}
         self.admin_ids = self.get_admin_ids()
-        self.web_app = None
         self.runner = None
         
         # Initialize cookies
@@ -220,10 +218,6 @@ class YouTubeDownloaderBot:
                     <p>1. Find the bot on Telegram: <code>@YourBotUsername</code></p>
                     <p>2. Send <code>/start</code> to begin</p>
                     <p>3. Use <code>/yt</code> to download videos</p>
-                    
-                    <h2>⚙️ Configuration</h2>
-                    <p><strong>Cookies:</strong> <span id="cookies-status">Checking...</span></p>
-                    <p><strong>Port:</strong> <code id="port">Loading...</code></p>
                 </div>
                 
                 <script>
@@ -233,9 +227,6 @@ class YouTubeDownloaderBot:
                             const data = await response.json();
                             document.getElementById('status').innerHTML = 
                                 `<div class="status-ok">✅ Bot is running (Active downloads: ${data.active_downloads})</div>`;
-                            document.getElementById('cookies-status').textContent = 
-                                data.cookies_available ? '✅ Available' : '❌ Not configured';
-                            document.getElementById('port').textContent = window.location.port || '10000';
                         } catch (error) {
                             document.getElementById('status').innerHTML = 
                                 `<div class="status-error">❌ Error: ${error.message}</div>`;
@@ -243,7 +234,7 @@ class YouTubeDownloaderBot:
                     }
                     
                     updateStatus();
-                    setInterval(updateStatus, 30000); // Update every 30 seconds
+                    setInterval(updateStatus, 30000);
                 </script>
             </body>
             </html>
@@ -445,12 +436,16 @@ class YouTubeDownloaderBot:
                 del self.user_states[user_id]
                 await message.reply("❌ Operation cancelled.")
         
-        # FIXED: Handle ALL text messages - not just non-commands
-        @self.app.on_message(filters.text & ~filters.command)
+        # FIXED: Use custom filter instead of ~filters.command
+        @self.app.on_message(filters.text)
         async def handle_all_text_messages(client, message: Message):
-            """Handle all text messages except commands"""
+            """Handle all text messages"""
             user_id = message.from_user.id
             text = message.text.strip()
+            
+            # Skip if it's a command
+            if text.startswith('/'):
+                return
             
             logger.info(f"Received text from user {user_id}: {text[:50]}...")
             
