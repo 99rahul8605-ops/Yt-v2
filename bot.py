@@ -234,12 +234,12 @@ class YouTubeDownloaderBot:
             user_temp_dir = os.path.join(self.config['temp_dir'], f"user_{user_id}")
             os.makedirs(user_temp_dir, exist_ok=True)
             
-            # Step 1: Fetch video info
+            # Step 1: Fetch video info (always try with cookies first)
             await self.update_status(status_msg, "📥 Fetching video information...")
             video_info = await self.get_video_info(url)
             
             if not video_info:
-                await status_msg.edit_text("❌ Failed to fetch video information. The video might be private or removed.")
+                await status_msg.edit_text("❌ Failed to fetch video information. The video might be private, age-restricted, or removed. Make sure cookies.txt is properly set up for age-restricted videos.")
                 return
             
             # Step 2: Check duration limit
@@ -292,7 +292,7 @@ class YouTubeDownloaderBot:
             await self.cleanup_user_files(user_id)
     
     async def get_video_info(self, url: str) -> Optional[Dict]:
-        """Fetch video metadata using yt-dlp"""
+        """Fetch video metadata using yt-dlp - ALWAYS use cookies if available"""
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
@@ -301,9 +301,12 @@ class YouTubeDownloaderBot:
             'extractor_args': {'youtube': {'skip': ['hls', 'dash']}},
         }
         
-        # Add cookies if available
+        # ALWAYS use cookies if available to avoid "Sign in to confirm you're not a bot" errors
         if self.config['cookies_path'] and os.path.exists(self.config['cookies_path']):
             ydl_opts['cookiefile'] = self.config['cookies_path']
+            logger.info("Using cookies for video info fetch")
+        else:
+            logger.warning("No cookies file found. Some videos may not work.")
         
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -333,6 +336,31 @@ class YouTubeDownloaderBot:
                 
         except Exception as e:
             logger.error(f"Error getting video info: {e}")
+            
+            # Try without cookies if we were using them
+            if 'cookiefile' in ydl_opts:
+                logger.info("Retrying without cookies...")
+                try:
+                    del ydl_opts['cookiefile']
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(url, download=False)
+                        if info:
+                            if 'entries' in info:
+                                info = info['entries'][0]
+                            video_info = {
+                                'id': info.get('id'),
+                                'title': self.sanitize_filename(info.get('title', 'video')),
+                                'duration': info.get('duration', 0),
+                                'uploader': info.get('uploader', 'Unknown'),
+                                'formats': info.get('formats', []),
+                                'description': info.get('description', '')[:100],
+                                'webpage_url': info.get('webpage_url', url),
+                                'thumbnail': info.get('thumbnail'),
+                            }
+                            return video_info
+                except Exception as e2:
+                    logger.error(f"Error getting video info without cookies: {e2}")
+            
             return None
     
     def sanitize_filename(self, filename: str) -> str:
@@ -344,7 +372,7 @@ class YouTubeDownloaderBot:
         return filename.strip()
     
     async def download_video(self, url: str, video_info: Dict, temp_dir: str) -> Optional[Dict]:
-        """Download video using yt-dlp with fallback logic"""
+        """Download video using yt-dlp"""
         base_ydl_opts = {
             'quiet': True,
             'no_warnings': True,
@@ -356,7 +384,11 @@ class YouTubeDownloaderBot:
             'extractor_args': {'youtube': {'skip': ['hls', 'dash']}},
         }
         
-        # Try without cookies first
+        # ALWAYS use cookies if available
+        if self.config['cookies_path'] and os.path.exists(self.config['cookies_path']):
+            base_ydl_opts['cookiefile'] = self.config['cookies_path']
+            logger.info("Using cookies for download")
+        
         formats = self.select_format(video_info['formats'])
         ydl_opts = base_ydl_opts.copy()
         ydl_opts['format'] = formats['primary']
@@ -364,27 +396,18 @@ class YouTubeDownloaderBot:
         try:
             return await self._download_with_opts(url, ydl_opts, temp_dir)
             
-        except yt_dlp.utils.DownloadError as e:
+        except Exception as e:
             error_msg = str(e).lower()
-            logger.warning(f"Download failed without cookies: {error_msg[:100]}")
+            logger.error(f"Download failed: {error_msg[:200]}")
             
-            # Check if cookies might help
-            if any(keyword in error_msg for keyword in ['sign in', 'age verification', 'private', 'members only', 'login']):
-                if self.config['cookies_path'] and os.path.exists(self.config['cookies_path']):
-                    logger.info("Trying with cookies...")
-                    ydl_opts = base_ydl_opts.copy()
-                    ydl_opts['format'] = formats['fallback']
-                    ydl_opts['cookiefile'] = self.config['cookies_path']
-                    
-                    try:
-                        return await self._download_with_opts(url, ydl_opts, temp_dir)
-                    except Exception as e2:
-                        logger.error(f"Failed even with cookies: {e2}")
-                        raise Exception("Video requires login but cookies didn't work")
-                else:
-                    raise Exception("Video requires login. Cookies file not configured.")
-            else:
-                raise
+            # Try fallback format
+            try:
+                ydl_opts = base_ydl_opts.copy()
+                ydl_opts['format'] = formats['fallback']
+                return await self._download_with_opts(url, ydl_opts, temp_dir)
+            except Exception as e2:
+                logger.error(f"Fallback download also failed: {e2}")
+                raise Exception(f"Download failed: {str(e)[:100]}")
     
     async def _download_with_opts(self, url: str, ydl_opts: Dict, temp_dir: str) -> Dict:
         """Execute yt-dlp with given options"""
