@@ -2,9 +2,10 @@ import os
 import asyncio
 import re
 import shutil
+import json
 import logging
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -26,6 +27,7 @@ class YouTubeDownloaderBot:
         self.app = None
         self.user_states = {}
         self.active_downloads = {}
+        self.cookies_available = False
         
     def load_config(self) -> Dict[str, Any]:
         """Load configuration from environment variables"""
@@ -33,22 +35,35 @@ class YouTubeDownloaderBot:
             'api_id': int(os.getenv('TELEGRAM_API_ID', 0)),
             'api_hash': os.getenv('TELEGRAM_API_HASH', ''),
             'bot_token': os.getenv('TELEGRAM_BOT_TOKEN', ''),
-            'cookies_path': os.getenv('YOUTUBE_COOKIES_PATH', ''),
-            'max_duration': int(os.getenv('MAX_DURATION', '3600')),
-            'max_file_size': int(os.getenv('MAX_FILE_SIZE', '2000000000')),
+            'cookies_path': os.getenv('YOUTUBE_COOKIES_PATH', '/tmp/cookies.txt'),
+            'max_duration': int(os.getenv('MAX_DURATION', '1800')),  # 30 minutes default
+            'max_file_size': int(os.getenv('MAX_FILE_SIZE', '1500000000')),  # 1.5GB
             'allowed_users': os.getenv('ALLOWED_USERS', '').split(',') if os.getenv('ALLOWED_USERS') else [],
-            'max_concurrent': int(os.getenv('MAX_CONCURRENT_DOWNLOADS', '2')),
+            'max_concurrent': int(os.getenv('MAX_CONCURRENT_DOWNLOADS', '1')),
             'temp_dir': os.getenv('TEMP_DIR', '/tmp/ytdl'),
         }
         
         # Create temp directory
         os.makedirs(config['temp_dir'], exist_ok=True)
         
+        # Check cookies file
+        if os.path.exists(config['cookies_path']):
+            cookies_size = os.path.getsize(config['cookies_path'])
+            if cookies_size > 100:  # At least 100 bytes
+                self.cookies_available = True
+                logger.info(f"Cookies file found: {config['cookies_path']} ({cookies_size} bytes)")
+            else:
+                logger.warning(f"Cookies file is too small or empty: {config['cookies_path']}")
+        else:
+            logger.warning(f"No cookies file found at: {config['cookies_path']}")
+            logger.warning("Age-restricted videos may not work without cookies.")
+        
         # Validate required config
         if not all([config['api_id'], config['api_hash'], config['bot_token']]):
             raise ValueError("Missing required Telegram configuration. Check TELEGRAM_API_ID, TELEGRAM_API_HASH, and TELEGRAM_BOT_TOKEN.")
             
         logger.info("Configuration loaded successfully")
+        logger.info(f"Cookies available: {self.cookies_available}")
         return config
     
     async def check_user_access(self, user_id: int) -> bool:
@@ -89,23 +104,25 @@ class YouTubeDownloaderBot:
                 await message.reply("❌ You are not authorized to use this bot.")
                 return
             
+            cookies_status = "✅ Available" if self.cookies_available else "❌ Not configured"
+            
             await message.reply(
                 "🎬 **YouTube Video Downloader Bot**\n\n"
                 "**Commands:**\n"
                 "• /yt - Download a YouTube video\n"
                 "• /status - Check bot status\n"
+                "• /cookies - Check cookies status\n"
                 "• /help - Show this message\n\n"
-                "**Usage:**\n"
-                "1. Send /yt\n"
-                "2. Reply with a YouTube URL\n\n"
                 "**Limits:**\n"
-                "• Max duration: 60 minutes\n"
+                f"• Max duration: {self.config['max_duration']//60} minutes\n"
                 "• Max resolution: 720p\n"
                 "• Format: MP4\n\n"
-                "**Notes:**\n"
-                "• Processing may take time for long videos\n"
-                "• Age-restricted videos require cookies setup\n"
-                "• Videos are automatically deleted after sending"
+                f"**Cookies Status:** {cookies_status}\n"
+                "• Age-restricted videos require cookies\n"
+                "• Contact admin for cookies setup\n\n"
+                "**Usage:**\n"
+                "1. Send /yt\n"
+                "2. Reply with a YouTube URL"
             )
         
         @self.app.on_message(filters.command("yt"))
@@ -136,7 +153,8 @@ class YouTubeDownloaderBot:
                 "• youtube.com/watch?v=...\n"
                 "• youtu.be/...\n"
                 "• youtube.com/shorts/...\n"
-                "• youtube.com/playlist?list=... (first video only)"
+                "• youtube.com/playlist?list=... (first video only)\n\n"
+                f"**Cookies:** {'✅ Active' if self.cookies_available else '❌ Not configured'}"
             )
         
         @self.app.on_message(filters.command("status"))
@@ -158,6 +176,7 @@ class YouTubeDownloaderBot:
                     f"**Memory:** {memory.percent}% used\n"
                     f"**Disk:** {disk.percent}% used\n"
                     f"**Active Downloads:** {len(self.active_downloads)}\n"
+                    f"**Cookies:** {'✅ Available' if self.cookies_available else '❌ Not configured'}\n"
                     f"**Temp Directory:** {self.config['temp_dir']}\n\n"
                     "✅ Bot is running normally"
                 )
@@ -166,6 +185,38 @@ class YouTubeDownloaderBot:
             except Exception as e:
                 logger.error(f"Error in status command: {e}")
                 await message.reply("🤖 Bot is running normally")
+        
+        @self.app.on_message(filters.command("cookies"))
+        async def cookies_command(client, message: Message):
+            """Check cookies status"""
+            cookies_path = self.config['cookies_path']
+            
+            if self.cookies_available:
+                cookies_size = os.path.getsize(cookies_path)
+                cookies_text = (
+                    "🍪 **Cookies Status**\n\n"
+                    f"✅ **Status:** Active and working\n"
+                    f"📁 **Location:** `{cookies_path}`\n"
+                    f"📏 **Size:** {cookies_size} bytes\n"
+                    f"🔄 **Age-restricted videos:** Supported\n\n"
+                    "Cookies are properly configured and should work with age-restricted content."
+                )
+            else:
+                cookies_text = (
+                    "🍪 **Cookies Status**\n\n"
+                    "❌ **Status:** Not configured or invalid\n\n"
+                    "**Without cookies:**\n"
+                    "• Age-restricted videos will fail\n"
+                    "• Some videos may require sign-in\n"
+                    "• YouTube may block some requests\n\n"
+                    "**To fix:**\n"
+                    "1. Export cookies from your browser\n"
+                    "2. Save as `cookies.txt`\n"
+                    "3. Upload to the server\n"
+                    "4. Set path in environment variables"
+                )
+            
+            await message.reply(cookies_text)
         
         @self.app.on_message(filters.command("cancel"))
         async def cancel_command(client, message: Message):
@@ -215,6 +266,63 @@ class YouTubeDownloaderBot:
         
         return any(re.search(pattern, url, re.IGNORECASE) for pattern in patterns)
     
+    def get_ydl_options(self, for_download: bool = False) -> Dict:
+        """Get yt-dlp options with proper cookies and headers"""
+        base_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'socket_timeout': 30,
+            'retries': 10,
+            'fragment_retries': 10,
+            'ignoreerrors': True,
+            'no_check_certificate': True,
+            'prefer_insecure': False,
+            'extract_flat': False,
+            
+            # Browser-like headers
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+            },
+            
+            # YouTube specific options
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'web'],
+                    'player_skip': ['configs', 'webpage'],
+                }
+            },
+            
+            # Throttling to avoid detection
+            'throttledratelimit': 1000000,
+            'ratelimit': 5000000,
+        }
+        
+        # Add cookies if available
+        if self.cookies_available:
+            base_opts['cookiefile'] = self.config['cookies_path']
+            logger.debug("Adding cookies to yt-dlp options")
+        
+        if for_download:
+            # Download-specific options
+            base_opts.update({
+                'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
+                'merge_output_format': 'mp4',
+                'postprocessors': [{
+                    'key': 'FFmpegVideoConvertor',
+                    'preferedformat': 'mp4',
+                }],
+                'outtmpl': '%(title)s.%(ext)s',
+                'progress_hooks': [self.download_progress_hook],
+            })
+        
+        return base_opts
+    
     async def process_video(self, message: Message, url: str):
         """Main processing pipeline"""
         user_id = message.from_user.id
@@ -234,12 +342,18 @@ class YouTubeDownloaderBot:
             user_temp_dir = os.path.join(self.config['temp_dir'], f"user_{user_id}")
             os.makedirs(user_temp_dir, exist_ok=True)
             
-            # Step 1: Fetch video info (always try with cookies first)
+            # Step 1: Fetch video info (ALWAYS try with cookies first)
             await self.update_status(status_msg, "📥 Fetching video information...")
             video_info = await self.get_video_info(url)
             
             if not video_info:
-                await status_msg.edit_text("❌ Failed to fetch video information. The video might be private, age-restricted, or removed. Make sure cookies.txt is properly set up for age-restricted videos.")
+                error_msg = "❌ Failed to fetch video information."
+                if not self.cookies_available:
+                    error_msg += "\n\n⚠️ **Cookies not configured!**\nSome videos (especially age-restricted ones) require cookies to work."
+                else:
+                    error_msg += "\n\nPossible reasons:\n• Video is private/removed\n• Region restricted\n• Requires age verification\n• YouTube anti-bot detection"
+                
+                await status_msg.edit_text(error_msg)
                 return
             
             # Step 2: Check duration limit
@@ -257,7 +371,10 @@ class YouTubeDownloaderBot:
             downloaded_files = await self.download_video(url, video_info, user_temp_dir)
             
             if not downloaded_files:
-                await status_msg.edit_text("❌ Failed to download video. It might be age-restricted or unavailable.")
+                error_msg = "❌ Failed to download video."
+                if not self.cookies_available and "age" in video_info.get('description', '').lower():
+                    error_msg += "\n\n⚠️ This appears to be an age-restricted video. Cookies are required to download age-restricted content."
+                await status_msg.edit_text(error_msg)
                 return
             
             # Step 4: Process files
@@ -281,7 +398,10 @@ class YouTubeDownloaderBot:
         except Exception as e:
             logger.error(f"Error processing video: {e}", exc_info=True)
             try:
-                await message.reply(f"❌ Error: {str(e)[:200]}")
+                error_msg = f"❌ Error: {str(e)[:200]}"
+                if "cookies" in str(e).lower() or "sign in" in str(e).lower():
+                    error_msg += "\n\n⚠️ **Cookies Issue Detected**\nThis video may require cookies or the cookies file may be invalid."
+                await message.reply(error_msg)
             except:
                 pass
         
@@ -292,21 +412,8 @@ class YouTubeDownloaderBot:
             await self.cleanup_user_files(user_id)
     
     async def get_video_info(self, url: str) -> Optional[Dict]:
-        """Fetch video metadata using yt-dlp - ALWAYS use cookies if available"""
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'extract_flat': False,
-            'socket_timeout': 30,
-            'extractor_args': {'youtube': {'skip': ['hls', 'dash']}},
-        }
-        
-        # ALWAYS use cookies if available to avoid "Sign in to confirm you're not a bot" errors
-        if self.config['cookies_path'] and os.path.exists(self.config['cookies_path']):
-            ydl_opts['cookiefile'] = self.config['cookies_path']
-            logger.info("Using cookies for video info fetch")
-        else:
-            logger.warning("No cookies file found. Some videos may not work.")
+        """Fetch video metadata using yt-dlp"""
+        ydl_opts = self.get_ydl_options(for_download=False)
         
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -326,23 +433,28 @@ class YouTubeDownloaderBot:
                     'duration': info.get('duration', 0),
                     'uploader': info.get('uploader', 'Unknown'),
                     'formats': info.get('formats', []),
-                    'description': info.get('description', '')[:100],
+                    'description': info.get('description', '')[:200],
                     'webpage_url': info.get('webpage_url', url),
                     'thumbnail': info.get('thumbnail'),
+                    'age_limit': info.get('age_limit', 0),
                 }
                 
-                logger.info(f"Video info fetched: {video_info['title']} ({video_info['duration']}s)")
+                logger.info(f"Video info fetched: {video_info['title']} ({video_info['duration']}s), Age limit: {video_info['age_limit']}")
                 return video_info
                 
-        except Exception as e:
-            logger.error(f"Error getting video info: {e}")
+        except yt_dlp.utils.DownloadError as e:
+            error_msg = str(e).lower()
+            logger.error(f"yt-dlp error getting video info: {error_msg[:200]}")
             
-            # Try without cookies if we were using them
-            if 'cookiefile' in ydl_opts:
+            # Try without cookies if cookies were used
+            if self.cookies_available:
                 logger.info("Retrying without cookies...")
                 try:
-                    del ydl_opts['cookiefile']
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl_opts_without_cookies = ydl_opts.copy()
+                    if 'cookiefile' in ydl_opts_without_cookies:
+                        del ydl_opts_without_cookies['cookiefile']
+                    
+                    with yt_dlp.YoutubeDL(ydl_opts_without_cookies) as ydl:
                         info = ydl.extract_info(url, download=False)
                         if info:
                             if 'entries' in info:
@@ -353,14 +465,19 @@ class YouTubeDownloaderBot:
                                 'duration': info.get('duration', 0),
                                 'uploader': info.get('uploader', 'Unknown'),
                                 'formats': info.get('formats', []),
-                                'description': info.get('description', '')[:100],
+                                'description': info.get('description', '')[:200],
                                 'webpage_url': info.get('webpage_url', url),
                                 'thumbnail': info.get('thumbnail'),
+                                'age_limit': info.get('age_limit', 0),
                             }
+                            logger.info(f"Video info fetched without cookies: {video_info['title']}")
                             return video_info
                 except Exception as e2:
                     logger.error(f"Error getting video info without cookies: {e2}")
             
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error getting video info: {e}")
             return None
     
     def sanitize_filename(self, filename: str) -> str:
@@ -372,41 +489,31 @@ class YouTubeDownloaderBot:
         return filename.strip()
     
     async def download_video(self, url: str, video_info: Dict, temp_dir: str) -> Optional[Dict]:
-        """Download video using yt-dlp"""
-        base_ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
-            'progress_hooks': [self.download_progress_hook],
-            'socket_timeout': 30,
-            'retries': 3,
-            'fragment_retries': 3,
-            'extractor_args': {'youtube': {'skip': ['hls', 'dash']}},
-        }
+        """Download video using yt-dlp with cookies"""
+        ydl_opts = self.get_ydl_options(for_download=True)
+        ydl_opts['outtmpl'] = os.path.join(temp_dir, '%(title)s.%(ext)s')
         
-        # ALWAYS use cookies if available
-        if self.config['cookies_path'] and os.path.exists(self.config['cookies_path']):
-            base_ydl_opts['cookiefile'] = self.config['cookies_path']
-            logger.info("Using cookies for download")
+        # Try primary format first
+        format_primary = "bestvideo[height<=720]+bestaudio/best[height<=720]"
+        format_fallback = "best"
         
-        formats = self.select_format(video_info['formats'])
-        ydl_opts = base_ydl_opts.copy()
-        ydl_opts['format'] = formats['primary']
+        # Try with primary format
+        ydl_opts['format'] = format_primary
         
         try:
+            logger.info(f"Downloading with format: {format_primary}")
             return await self._download_with_opts(url, ydl_opts, temp_dir)
             
         except Exception as e:
-            error_msg = str(e).lower()
-            logger.error(f"Download failed: {error_msg[:200]}")
+            logger.warning(f"Primary format failed: {e}. Trying fallback...")
             
             # Try fallback format
+            ydl_opts['format'] = format_fallback
             try:
-                ydl_opts = base_ydl_opts.copy()
-                ydl_opts['format'] = formats['fallback']
+                logger.info(f"Downloading with format: {format_fallback}")
                 return await self._download_with_opts(url, ydl_opts, temp_dir)
             except Exception as e2:
-                logger.error(f"Fallback download also failed: {e2}")
+                logger.error(f"Fallback format also failed: {e2}")
                 raise Exception(f"Download failed: {str(e)[:100]}")
     
     async def _download_with_opts(self, url: str, ydl_opts: Dict, temp_dir: str) -> Dict:
@@ -424,15 +531,41 @@ class YouTubeDownloaderBot:
             for file in Path(temp_dir).glob('*'):
                 if file.is_file():
                     ext = file.suffix.lower()
+                    file_size = file.stat().st_size
+                    
+                    # Check for video files
                     if ext in ['.mp4', '.mkv', '.webm', '.flv', '.avi']:
-                        # Check if it's likely a video file by size (> 100KB)
-                        if file.stat().st_size > 1024 * 100:
+                        if file_size > 1024 * 100:  # > 100KB
                             downloaded_files['video'] = str(file)
-                    elif ext in ['.m4a', '.mp3', '.webm', '.opus', '.aac']:
-                        downloaded_files['audio'] = str(file)
+                            logger.info(f"Found video file: {file.name} ({file_size} bytes)")
+                    
+                    # Check for audio files
+                    elif ext in ['.m4a', '.mp3', '.webm', '.opus', '.aac', '.flac', '.wav']:
+                        if file_size > 1024 * 50:  # > 50KB
+                            downloaded_files['audio'] = str(file)
+                            logger.info(f"Found audio file: {file.name} ({file_size} bytes)")
+                    
+                    # Check for merged files
+                    elif 'merged' in file.name.lower() or 'final' in file.name.lower():
+                        if file_size > 1024 * 100:
+                            downloaded_files['merged'] = str(file)
+                            logger.info(f"Found merged file: {file.name} ({file_size} bytes)")
             
-            logger.info(f"Downloaded files: {downloaded_files}")
-            return downloaded_files
+            # If we have a merged file from yt-dlp, use it
+            if downloaded_files['merged']:
+                logger.info("Using yt-dlp merged file")
+                return downloaded_files
+            
+            # Otherwise check if we have separate video and audio
+            if downloaded_files['video'] and downloaded_files['audio']:
+                logger.info("Found separate video and audio files")
+                return downloaded_files
+            elif downloaded_files['video']:
+                logger.info("Found only video file (probably already merged)")
+                return downloaded_files
+            else:
+                logger.error("No valid video files found")
+                return {}
     
     def download_progress_hook(self, d):
         """Progress hook for yt-dlp"""
@@ -441,36 +574,31 @@ class YouTubeDownloaderBot:
             speed = d.get('_speed_str', 'N/A')
             eta = d.get('_eta_str', 'N/A')
             logger.debug(f"Download: {percent} at {speed}, ETA: {eta}")
-    
-    def select_format(self, formats: list) -> Dict:
-        """Select best format based on rules"""
-        # Try: bestvideo(height<=720) + bestaudio
-        format_primary = "bestvideo[height<=720]+bestaudio/best[height<=720]"
-        # Fallback: best
-        format_fallback = "best"
-        
-        return {
-            'primary': format_primary,
-            'fallback': format_fallback
-        }
+        elif d['status'] == 'finished':
+            logger.info("Download completed")
     
     async def process_downloaded_files(self, files: Dict, temp_dir: str) -> Optional[str]:
         """Process downloaded files (merge if needed)"""
-        if files['video'] and files['audio']:
-            # Need to merge audio and video
+        # If we already have a merged file, use it
+        if files.get('merged'):
+            return files['merged']
+        
+        # If we have separate video and audio, merge them
+        if files.get('video') and files.get('audio'):
             logger.info("Merging audio and video streams")
             return await self.merge_audio_video(files['video'], files['audio'], temp_dir)
-        elif files['video']:
-            # Already a single file
+        
+        # If we only have video, use it directly
+        elif files.get('video'):
             logger.info("Using single video file")
             return files['video']
-        else:
-            logger.error("No video file found")
-            return None
+        
+        logger.error("No valid video file found")
+        return None
     
     async def merge_audio_video(self, video_path: str, audio_path: str, temp_dir: str) -> Optional[str]:
         """Merge audio and video streams using ffmpeg"""
-        output_path = os.path.join(temp_dir, "merged_video.mp4")
+        output_path = os.path.join(temp_dir, "merged_output.mp4")
         
         try:
             logger.info(f"Merging {video_path} and {audio_path} -> {output_path}")
@@ -484,7 +612,7 @@ class YouTubeDownloaderBot:
                 input_audio,
                 output_path,
                 vcodec='copy',
-                acodec='copy',
+                acodec='aac',  # Use AAC for compatibility
                 **{'strict': 'experimental'}
             ).run(quiet=True, overwrite_output=True, capture_stdout=True, capture_stderr=True)
             
@@ -497,6 +625,18 @@ class YouTubeDownloaderBot:
             
         except ffmpeg.Error as e:
             logger.error(f"FFmpeg error: {e.stderr.decode() if e.stderr else str(e)}")
+            
+            # Try alternative method
+            try:
+                output_path2 = os.path.join(temp_dir, "merged_output2.mp4")
+                os.system(f'ffmpeg -i "{video_path}" -i "{audio_path}" -c copy -map 0:v:0 -map 1:a:0 "{output_path2}" -y')
+                
+                if os.path.exists(output_path2) and os.path.getsize(output_path2) > 0:
+                    logger.info(f"Alternative merge successful: {output_path2}")
+                    return output_path2
+            except Exception as e2:
+                logger.error(f"Alternative merge also failed: {e2}")
+            
         except Exception as e:
             logger.error(f"Error merging files: {e}")
         
@@ -504,7 +644,7 @@ class YouTubeDownloaderBot:
     
     async def generate_thumbnail(self, video_path: str) -> Optional[str]:
         """Generate thumbnail from video"""
-        thumbnail_path = video_path + "_thumb.jpg"
+        thumbnail_path = video_path.rsplit('.', 1)[0] + "_thumb.jpg"
         
         try:
             logger.info(f"Generating thumbnail for {video_path}")
@@ -522,7 +662,7 @@ class YouTubeDownloaderBot:
             if os.path.exists(thumbnail_path) and os.path.getsize(thumbnail_path) > 0:
                 return thumbnail_path
             else:
-                logger.warning("Thumbnail generation failed, using default")
+                logger.warning("Thumbnail generation failed")
                 
         except Exception as e:
             logger.error(f"Error generating thumbnail: {e}")
@@ -540,8 +680,8 @@ class YouTubeDownloaderBot:
             
             logger.info(f"Uploading video: {file_size} bytes, {duration} seconds")
             
-            # Check file size limit (Telegram has 2GB limit for bots)
-            max_size = min(self.config['max_file_size'], 2000 * 1024 * 1024)  # 2GB or config
+            # Check file size limit
+            max_size = self.config['max_file_size']
             if file_size > max_size:
                 await message.reply(f"❌ Video file too large ({file_size//(1024*1024)}MB). Max allowed: {max_size//(1024*1024)}MB.")
                 return
@@ -551,7 +691,8 @@ class YouTubeDownloaderBot:
             # Progress callback
             def progress(current, total):
                 percent = (current / total) * 100
-                logger.debug(f"Upload progress: {percent:.1f}% ({current}/{total})")
+                if int(percent) % 10 == 0:  # Log every 10%
+                    logger.debug(f"Upload progress: {percent:.1f}% ({current}/{total})")
             
             # Try to send as video first
             try:
