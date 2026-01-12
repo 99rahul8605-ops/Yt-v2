@@ -485,8 +485,9 @@ class YouTubeDownloaderBot:
             duration = float(probe['format']['duration'])
             frame_time = min(10, duration / 4)
             
+            # FIXED: Changed qscale:v=2 to qscale_v=2
             ffmpeg.input(video_path, ss=frame_time)\
-                  .output(thumbnail_path, vframes=1, qscale:v=2)\
+                  .output(thumbnail_path, vframes=1, qscale_v=2)\
                   .run(quiet=True, overwrite_output=True, capture_stdout=True, capture_stderr=True)
             
             if os.path.exists(thumbnail_path) and os.path.getsize(thumbnail_path) > 0:
