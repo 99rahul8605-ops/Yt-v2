@@ -14,15 +14,20 @@ services:
       - key: YOUTUBE_COOKIES_PATH
         value: "/tmp/cookies.txt"
         sync: false
+      - key: ADMIN_USERS
+        value: "YOUR_TELEGRAM_USER_ID"
+        sync: false
       - key: MAX_DURATION
-        value: "3600"
+        value: "1800"
       - key: MAX_FILE_SIZE
-        value: "2000000000"
+        value: "1500000000"
       - key: MAX_CONCURRENT_DOWNLOADS
-        value: "2"
-      - key: ALLOWED_USERS
-        value: ""
+        value: "1"
       - key: TEMP_DIR
         value: "/tmp/ytdl"
+      - key: COOKIES_BACKUP_DIR
+        value: "/tmp/cookies_backup"
+      - key: PORT
+        value: "8080"
     healthCheckPath: /health
     autoDeploy: true
