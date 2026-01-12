@@ -24,11 +24,15 @@ COPY . .
 RUN mkdir -p /tmp/ytdl /tmp/cookies_backup && \
     chmod 777 /tmp/ytdl /tmp/cookies_backup
 
+# Expose port for HTTP server
+EXPOSE 8080
+
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
 ENV TEMP_DIR=/tmp/ytdl
 ENV YOUTUBE_COOKIES_PATH=/tmp/cookies.txt
 ENV COOKIES_BACKUP_DIR=/tmp/cookies_backup
+ENV PORT=8080
 
 # Run as non-root user
 USER 1000
