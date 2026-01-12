@@ -1,7 +1,6 @@
-python-telegram-bot==13.15
-yt-dlp==2024.4.9
-requests==2.31.0
-aiohttp==3.9.3
-python-dotenv==1.0.0
-beautifulsoup4==4.12.3
-Pillow==10.2.0
+psutil==5.9.6
+TgCrypto==1.2.5
+aiohttp==3.9.1
+pyrogram==2.0.106
+yt-dlp==2023.11.16
+ffmpeg-python==0.2.0
