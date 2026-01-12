@@ -2,7 +2,8 @@
 FROM python:3.11-slim
 
 # Install system dependencies including libnss3 for browser compatibility
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     ffmpeg \
     wget \
     curl \
@@ -20,6 +21,7 @@ RUN apt-get update && apt-get install -y \
     libxrender1 \
     libxtst6 \
     libgtk-3-0 \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
