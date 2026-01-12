@@ -24,6 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 class YouTubeDownloaderBot:
     def __init__(self):
         self.config = self.load_config()
@@ -54,6 +55,7 @@ class YouTubeDownloaderBot:
             'max_concurrent': int(os.getenv('MAX_CONCURRENT_DOWNLOADS', '1')),
             'temp_dir': os.getenv('TEMP_DIR', '/tmp/ytdl'),
             'port': int(os.getenv('PORT', '10000')),
+            'proxy_url': os.getenv('PROXY_URL', ''),  # Add proxy support
         }
         
         # Create directories
@@ -66,6 +68,8 @@ class YouTubeDownloaderBot:
             
         logger.info("Configuration loaded successfully")
         logger.info(f"Web server will run on port: {config['port']}")
+        if config['proxy_url']:
+            logger.info(f"Proxy configured: {config['proxy_url']}")
         return config
     
     def get_admin_ids(self) -> List[str]:
@@ -94,7 +98,8 @@ class YouTubeDownloaderBot:
                 
                 # Read first few lines to check format
                 with open(cookies_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    first_line = f.readline().strip()
+                    content = f.read()
+                    first_line = content.split('\n')[0].strip() if content else ""
                     
                 self.cookies_available = cookies_size > 100
                 
@@ -159,15 +164,26 @@ class YouTubeDownloaderBot:
             
             # Check if it looks like a cookies.txt file
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                first_line = f.readline().strip()
-                lines = f.readlines()[:10]
-                
+                content = f.read()
+                first_line = content.split('\n')[0].strip()
+            
             # Check for Netscape format header
             is_netscape = first_line.startswith('# Netscape HTTP Cookie File')
             
-            # Check for valid cookie lines
+            # Check for YouTube-specific cookies
+            youtube_domains = ['.youtube.com', 'youtube.com', '.youtu.be']
+            has_youtube_cookies = any(domain in content for domain in youtube_domains)
+            
+            # Check for important YouTube cookies
+            important_cookies = ['LOGIN_INFO', 'SID', 'HSID', 'SSID', 'APISID', 'SAPISID', 'YSC', 'VISITOR_INFO1_LIVE']
+            has_important_cookies = any(cookie in content for cookie in important_cookies)
+            
+            if not has_youtube_cookies:
+                return False, "No YouTube cookies found in file"
+            
+            # Count cookie lines
             cookie_lines = 0
-            for line in lines:
+            for line in content.split('\n'):
                 line = line.strip()
                 if line and not line.startswith('#'):
                     parts = line.split('\t')
@@ -177,13 +193,15 @@ class YouTubeDownloaderBot:
             if cookie_lines == 0 and not is_netscape:
                 return False, "File doesn't appear to be a valid cookies.txt format"
             
-            # Check for YouTube domain
-            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-                if '.youtube.com' not in content and 'youtube.com' not in content:
-                    return False, "No YouTube cookies found in file"
+            validation_msg = (
+                f"Valid cookies file. Size: {file_size} bytes, "
+                f"Format: {'Netscape' if is_netscape else 'Unknown'}, "
+                f"Cookie lines: {cookie_lines}, "
+                f"YouTube domains: {has_youtube_cookies}, "
+                f"Important cookies: {has_important_cookies}"
+            )
             
-            return True, f"Valid cookies file. Size: {file_size} bytes, Format: {'Netscape' if is_netscape else 'Unknown'}, Cookie lines: {cookie_lines}"
+            return True, validation_msg
             
         except Exception as e:
             return False, f"Error validating file: {str(e)}"
@@ -373,6 +391,7 @@ class YouTubeDownloaderBot:
                     "• /cookies_backup - Backup current cookies\n"
                     "• /cookies_test - Test cookies with YouTube\n"
                     "• /cookies_delete - Delete cookies file\n"
+                    "• /cookies_refresh - Refresh cookies status\n"
                 )
             
             await message.reply(
@@ -559,8 +578,20 @@ class YouTubeDownloaderBot:
                     'no_warnings': True,
                     'extract_flat': True,
                     'cookiefile': self.config['cookies_path'],
-                    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'http_headers': {
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.5',
+                        'Accept-Encoding': 'gzip, deflate',
+                        'DNT': '1',
+                        'Connection': 'keep-alive',
+                        'Upgrade-Insecure-Requests': '1',
+                    }
                 }
+                
+                # Add proxy if configured
+                if self.config.get('proxy_url'):
+                    ydl_opts['proxy'] = self.config['proxy_url']
                 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(test_url, download=False)
@@ -665,6 +696,36 @@ class YouTubeDownloaderBot:
                 "Are you sure you want to delete the cookies file?",
                 reply_markup=keyboard
             )
+        
+        @self.app.on_message(filters.command("cookies_refresh"))
+        async def cookies_refresh_command(client, message: Message):
+            """Manually refresh cookies status (Admin only)"""
+            if not await self.check_admin_access(message.from_user.id):
+                await message.reply("❌ Admin access required for this command.")
+                return
+            
+            status_msg = await message.reply("🔄 Refreshing cookies status...")
+            
+            old_status = self.cookies_available
+            self.check_cookies_file()
+            
+            if self.cookies_available:
+                if old_status:
+                    await status_msg.edit_text(
+                        "✅ **Cookies Refreshed**\n\n"
+                        f"Cookies are still active.\n"
+                        f"Size: {self.cookies_metadata.get('size', 0)} bytes\n"
+                        f"Modified: {self.cookies_metadata.get('modified', 'Unknown')}"
+                    )
+                else:
+                    await status_msg.edit_text(
+                        "✅ **Cookies Restored**\n\n"
+                        f"Cookies are now active!\n"
+                        f"Size: {self.cookies_metadata.get('size', 0)} bytes\n"
+                        f"Modified: {self.cookies_metadata.get('modified', 'Unknown')}"
+                    )
+            else:
+                await status_msg.edit_text("❌ No valid cookies file found.")
         
         @self.app.on_callback_query()
         async def handle_callback_query(client, callback_query):
@@ -894,9 +955,9 @@ class YouTubeDownloaderBot:
             user_temp_dir = os.path.join(self.config['temp_dir'], f"user_{user_id}")
             os.makedirs(user_temp_dir, exist_ok=True)
             
-            # Step 1: Fetch video info
+            # Step 1: Fetch video info with retry
             await self.update_status(status_msg, "📥 Fetching video information...")
-            video_info = await self.get_video_info(url)
+            video_info = await self.get_video_info_with_retry(url)
             
             if not video_info:
                 error_msg = "❌ Failed to fetch video information."
@@ -951,8 +1012,27 @@ class YouTubeDownloaderBot:
             logger.error(f"Error processing video: {e}", exc_info=True)
             try:
                 error_msg = f"❌ Error: {str(e)[:200]}"
-                if "cookies" in str(e).lower() or "sign in" in str(e).lower():
-                    error_msg += "\n\n⚠️ **Cookies Issue Detected**\nThis video may require cookies or the cookies file may be invalid."
+                
+                # Specific handling for sign-in errors
+                error_lower = str(e).lower()
+                if any(term in error_lower for term in ['sign in', 'confirm', 'not a bot', 'age verification']):
+                    error_msg = (
+                        "🔒 **YouTube Sign-In Required**\n\n"
+                        "YouTube is asking for sign-in verification for this video.\n\n"
+                        "**Possible reasons:**\n"
+                        "• The video is age-restricted\n"
+                        "• YouTube detected unusual activity\n"
+                        "• Region/country restrictions\n\n"
+                        "**Solutions to try:**\n"
+                        "1. Use a fresh cookies.txt file from a logged-in YouTube account\n"
+                        "2. Try downloading a different video\n"
+                        "3. Wait a few hours and try again\n"
+                        "4. Use a VPN/proxy (if supported)\n\n"
+                        f"**Cookies status:** {'✅ Active' if self.cookies_available else '❌ Not configured'}"
+                    )
+                elif "cookies" in error_lower:
+                    error_msg += "\n\n⚠️ **Cookies Issue Detected**\nThis video may require valid cookies or the cookies file may be expired/invalid."
+                
                 await message.reply(error_msg)
             except:
                 pass
@@ -963,6 +1043,29 @@ class YouTubeDownloaderBot:
                 del self.active_downloads[task_id]
             await self.cleanup_user_files(user_id)
     
+    async def get_video_info_with_retry(self, url: str, max_retries: int = 3) -> Optional[Dict]:
+        """Fetch video info with retry logic"""
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Fetching video info (attempt {attempt + 1}/{max_retries})")
+                info = await self.get_video_info(url)
+                if info:
+                    return info
+                
+                # Wait before retrying
+                wait_time = 2 ** attempt  # Exponential backoff: 1, 2, 4, 8 seconds
+                logger.info(f"Attempt {attempt + 1} failed, waiting {wait_time}s before retry...")
+                await asyncio.sleep(wait_time)
+                
+            except Exception as e:
+                logger.error(f"Attempt {attempt + 1} failed with error: {e}")
+                if attempt == max_retries - 1:
+                    raise
+                wait_time = 2 ** attempt
+                await asyncio.sleep(wait_time)
+        
+        return None
+    
     async def get_video_info(self, url: str) -> Optional[Dict]:
         """Fetch video metadata using yt-dlp"""
         ydl_opts = {
@@ -971,7 +1074,36 @@ class YouTubeDownloaderBot:
             'extract_flat': False,
             'socket_timeout': 30,
             'extractor_args': {'youtube': {'skip': ['hls', 'dash']}},
+            # Add comprehensive headers to mimic real browser
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Sec-Fetch-User': '?1',
+                'Cache-Control': 'max-age=0',
+            },
+            'compat_opts': {
+                'no-youtube-unavailable-videos': True,
+            },
+            # Add rate limiting to avoid detection
+            'ratelimit': 1048576,  # 1 MB/s
+            'throttledratelimit': 524288,  # 0.5 MB/s
+            'sleep_interval_requests': 1,
+            'sleep_interval': 5,
+            'max_sleep_interval': 15,
+            'sleep_interval_subtitles': 1,
         }
+        
+        # Add proxy if configured
+        if self.config.get('proxy_url'):
+            ydl_opts['proxy'] = self.config['proxy_url']
         
         # Add cookies if available
         if self.cookies_available:
@@ -980,6 +1112,8 @@ class YouTubeDownloaderBot:
         
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                # First try with verbose logging to see what's happening
+                logger.info(f"Attempting to extract info from: {url}")
                 info = ydl.extract_info(url, download=False)
                 
                 if not info:
@@ -1000,43 +1134,51 @@ class YouTubeDownloaderBot:
                     'webpage_url': info.get('webpage_url', url),
                     'thumbnail': info.get('thumbnail'),
                     'age_limit': info.get('age_limit', 0),
+                    'view_count': info.get('view_count', 0),
+                    'like_count': info.get('like_count', 0),
                 }
                 
                 logger.info(f"Video info fetched: {video_info['title']} ({video_info['duration']}s), Age limit: {video_info['age_limit']}")
                 return video_info
                 
+        except yt_dlp.utils.DownloadError as e:
+            logger.error(f"yt-dlp DownloadError: {e}")
+            
+            # Try alternative extraction method for problematic videos
+            try:
+                logger.info("Trying alternative extraction method...")
+                ydl_opts_alt = ydl_opts.copy()
+                ydl_opts_alt['extractor_args'] = {'youtube': {
+                    'skip': ['hls', 'dash'],
+                    'player_client': ['android', 'web'],
+                }}
+                ydl_opts_alt['extract_flat'] = True
+                
+                with yt_dlp.YoutubeDL(ydl_opts_alt) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    if info and 'entries' in info:
+                        info = info['entries'][0]
+                    
+                    if info:
+                        video_info = {
+                            'id': info.get('id'),
+                            'title': self.sanitize_filename(info.get('title', 'video')),
+                            'duration': info.get('duration', 0),
+                            'uploader': info.get('uploader', 'Unknown'),
+                            'formats': [],
+                            'description': info.get('description', '')[:200],
+                            'webpage_url': info.get('webpage_url', url),
+                            'thumbnail': info.get('thumbnail'),
+                            'age_limit': info.get('age_limit', 0),
+                        }
+                        logger.info(f"Video info fetched via alternative method: {video_info['title']}")
+                        return video_info
+            except Exception as e2:
+                logger.error(f"Alternative extraction also failed: {e2}")
+            
+            return None
         except Exception as e:
             logger.error(f"Error getting video info: {e}")
-            
-            # Try without cookies if cookies were used
-            if self.cookies_available:
-                logger.info("Retrying without cookies...")
-                try:
-                    ydl_opts_without_cookies = ydl_opts.copy()
-                    if 'cookiefile' in ydl_opts_without_cookies:
-                        del ydl_opts_without_cookies['cookiefile']
-                    
-                    with yt_dlp.YoutubeDL(ydl_opts_without_cookies) as ydl:
-                        info = ydl.extract_info(url, download=False)
-                        if info:
-                            if 'entries' in info:
-                                info = info['entries'][0]
-                            video_info = {
-                                'id': info.get('id'),
-                                'title': self.sanitize_filename(info.get('title', 'video')),
-                                'duration': info.get('duration', 0),
-                                'uploader': info.get('uploader', 'Unknown'),
-                                'formats': info.get('formats', []),
-                                'description': info.get('description', '')[:200],
-                                'webpage_url': info.get('webpage_url', url),
-                                'thumbnail': info.get('thumbnail'),
-                                'age_limit': info.get('age_limit', 0),
-                            }
-                            logger.info(f"Video info fetched without cookies: {video_info['title']}")
-                            return video_info
-                except Exception as e2:
-                    logger.error(f"Error getting video info without cookies: {e2}")
-            
             return None
     
     def sanitize_filename(self, filename: str) -> str:
@@ -1058,7 +1200,27 @@ class YouTubeDownloaderBot:
             'retries': 3,
             'fragment_retries': 3,
             'extractor_args': {'youtube': {'skip': ['hls', 'dash']}},
+            # Add comprehensive headers
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+            },
+            # Rate limiting
+            'ratelimit': 1048576,  # 1 MB/s
+            'throttledratelimit': 524288,  # 0.5 MB/s
+            'sleep_interval_requests': 1,
+            'sleep_interval': 5,
+            'max_sleep_interval': 15,
         }
+        
+        # Add proxy if configured
+        if self.config.get('proxy_url'):
+            base_ydl_opts['proxy'] = self.config['proxy_url']
         
         # Add cookies if available
         if self.cookies_available:
@@ -1334,6 +1496,20 @@ async def main():
     if env_path.exists():
         from dotenv import load_dotenv
         load_dotenv()
+    
+    # Try to update yt-dlp to latest version
+    try:
+        import subprocess
+        import sys
+        logger.info("Checking for yt-dlp updates...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"])
+        logger.info("yt-dlp updated to latest version")
+        
+        # Reload yt_dlp module after update
+        import importlib
+        importlib.reload(yt_dlp)
+    except Exception as e:
+        logger.warning(f"Could not update yt-dlp: {e}")
     
     bot = YouTubeDownloaderBot()
     await bot.run()
