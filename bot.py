@@ -1,3 +1,5 @@
+[file name]: bot.py
+[file content begin]
 import os
 import asyncio
 import re
@@ -35,6 +37,12 @@ class YouTubeDownloaderBot:
         self.admin_ids = self.get_admin_ids()
         self.runner = None
         self.cookie_upload_states = {}  # Track cookie upload states
+        self.user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        ]
         
         # Initialize cookies
         self.check_cookies_file()
@@ -54,6 +62,9 @@ class YouTubeDownloaderBot:
             'max_concurrent': int(os.getenv('MAX_CONCURRENT_DOWNLOADS', '1')),
             'temp_dir': os.getenv('TEMP_DIR', '/tmp/ytdl'),
             'port': int(os.getenv('PORT', '10000')),
+            'use_yt_dlp_cache': os.getenv('USE_YT_DLP_CACHE', 'true').lower() == 'true',
+            'yt_dlp_timeout': int(os.getenv('YT_DLP_TIMEOUT', '30')),
+            'max_retries': int(os.getenv('MAX_RETRIES', '3')),
         }
         
         # Create directories
@@ -552,14 +563,15 @@ class YouTubeDownloaderBot:
             
             try:
                 # Test with a simple YouTube request
-                test_url = "https://www.youtube.com/"
+                test_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"  # Use a known video
                 
                 ydl_opts = {
                     'quiet': True,
                     'no_warnings': True,
                     'extract_flat': True,
                     'cookiefile': self.config['cookies_path'],
-                    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'user_agent': self.user_agents[0],
+                    'socket_timeout': 30,
                 }
                 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -894,16 +906,18 @@ class YouTubeDownloaderBot:
             user_temp_dir = os.path.join(self.config['temp_dir'], f"user_{user_id}")
             os.makedirs(user_temp_dir, exist_ok=True)
             
-            # Step 1: Fetch video info
+            # Step 1: Fetch video info with retry mechanism
             await self.update_status(status_msg, "📥 Fetching video information...")
-            video_info = await self.get_video_info(url)
+            video_info = await self.get_video_info_with_retry(url, max_retries=3)
             
             if not video_info:
                 error_msg = "❌ Failed to fetch video information."
                 if not self.cookies_available:
                     error_msg += "\n\n⚠️ **Cookies not configured!**\nSome videos (especially age-restricted ones) require cookies to work."
                 else:
-                    error_msg += "\n\nPossible reasons:\n• Video is private/removed\n• Region restricted\n• Requires age verification"
+                    error_msg += "\n\nPossible reasons:\n• Video is private/removed\n• Region restricted\n• Requires age verification\n• YouTube bot protection is active"
+                    if self.cookies_available:
+                        error_msg += "\n• Cookies may be expired or invalid"
                 
                 await status_msg.edit_text(error_msg)
                 return
@@ -918,14 +932,16 @@ class YouTubeDownloaderBot:
                 )
                 return
             
-            # Step 3: Download video
+            # Step 3: Download video with retry
             await self.update_status(status_msg, f"⬇️ Downloading: {video_info['title'][:50]}...")
-            downloaded_files = await self.download_video(url, video_info, user_temp_dir)
+            downloaded_files = await self.download_video_with_retry(url, video_info, user_temp_dir, max_retries=3)
             
             if not downloaded_files:
                 error_msg = "❌ Failed to download video."
                 if not self.cookies_available and video_info.get('age_limit', 0) > 0:
                     error_msg += "\n\n⚠️ This appears to be an age-restricted video. Cookies are required to download age-restricted content."
+                elif self.cookies_available:
+                    error_msg += "\n\n⚠️ YouTube may be blocking this video due to bot detection. Try:\n1. Updating cookies file\n2. Using a different video\n3. Waiting some time"
                 await status_msg.edit_text(error_msg)
                 return
             
@@ -951,8 +967,8 @@ class YouTubeDownloaderBot:
             logger.error(f"Error processing video: {e}", exc_info=True)
             try:
                 error_msg = f"❌ Error: {str(e)[:200]}"
-                if "cookies" in str(e).lower() or "sign in" in str(e).lower():
-                    error_msg += "\n\n⚠️ **Cookies Issue Detected**\nThis video may require cookies or the cookies file may be invalid."
+                if "cookies" in str(e).lower() or "sign in" in str(e).lower() or "bot" in str(e).lower():
+                    error_msg += "\n\n⚠️ **Cookies Issue Detected**\nYouTube is requiring sign-in for this video.\nPossible solutions:\n1. Update cookies file with fresh cookies\n2. Try a different video\n3. Wait and try again later"
                 await message.reply(error_msg)
             except:
                 pass
@@ -963,81 +979,138 @@ class YouTubeDownloaderBot:
                 del self.active_downloads[task_id]
             await self.cleanup_user_files(user_id)
     
-    async def get_video_info(self, url: str) -> Optional[Dict]:
-        """Fetch video metadata using yt-dlp"""
+    async def get_video_info_with_retry(self, url: str, max_retries: int = 3) -> Optional[Dict]:
+        """Fetch video metadata with retry logic"""
+        for attempt in range(max_retries):
+            try:
+                ydl_opts = self.get_ydl_opts(for_info=True, attempt=attempt)
+                
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    
+                    if not info:
+                        continue
+                    
+                    # Handle playlists (take first video)
+                    if 'entries' in info:
+                        info = info['entries'][0]
+                    
+                    # Format the info
+                    video_info = {
+                        'id': info.get('id'),
+                        'title': self.sanitize_filename(info.get('title', 'video')),
+                        'duration': info.get('duration', 0),
+                        'uploader': info.get('uploader', 'Unknown'),
+                        'formats': info.get('formats', []),
+                        'description': info.get('description', '')[:200],
+                        'webpage_url': info.get('webpage_url', url),
+                        'thumbnail': info.get('thumbnail'),
+                        'age_limit': info.get('age_limit', 0),
+                    }
+                    
+                    logger.info(f"Video info fetched on attempt {attempt+1}: {video_info['title']} ({video_info['duration']}s), Age limit: {video_info['age_limit']}")
+                    return video_info
+                    
+            except Exception as e:
+                logger.warning(f"Attempt {attempt+1} failed: {str(e)[:200]}")
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # Exponential backoff
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.error(f"All {max_retries} attempts failed to fetch video info")
+        
+        return None
+    
+    def get_ydl_opts(self, for_info: bool = False, attempt: int = 0) -> Dict:
+        """Get yt-dlp options with intelligent configuration"""
+        # Base options
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
-            'extract_flat': False,
-            'socket_timeout': 30,
+            'socket_timeout': self.config['yt_dlp_timeout'],
             'extractor_args': {'youtube': {'skip': ['hls', 'dash']}},
+            'user_agent': self.user_agents[attempt % len(self.user_agents)],
         }
         
         # Add cookies if available
         if self.cookies_available:
             ydl_opts['cookiefile'] = self.config['cookies_path']
-            logger.info("Using cookies for video info fetch")
         
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                
-                if not info:
-                    return None
-                
-                # Handle playlists (take first video)
-                if 'entries' in info:
-                    info = info['entries'][0]
-                
-                # Format the info
-                video_info = {
-                    'id': info.get('id'),
-                    'title': self.sanitize_filename(info.get('title', 'video')),
-                    'duration': info.get('duration', 0),
-                    'uploader': info.get('uploader', 'Unknown'),
-                    'formats': info.get('formats', []),
-                    'description': info.get('description', '')[:200],
-                    'webpage_url': info.get('webpage_url', url),
-                    'thumbnail': info.get('thumbnail'),
-                    'age_limit': info.get('age_limit', 0),
-                }
-                
-                logger.info(f"Video info fetched: {video_info['title']} ({video_info['duration']}s), Age limit: {video_info['age_limit']}")
-                return video_info
-                
-        except Exception as e:
-            logger.error(f"Error getting video info: {e}")
+        if for_info:
+            ydl_opts['extract_flat'] = False
+        else:
+            # Download options
+            ydl_opts.update({
+                'retries': 3,
+                'fragment_retries': 3,
+                'ignoreerrors': False,
+                'no_overwrites': True,
+                'continue_dl': True,
+            })
             
-            # Try without cookies if cookies were used
-            if self.cookies_available:
-                logger.info("Retrying without cookies...")
-                try:
-                    ydl_opts_without_cookies = ydl_opts.copy()
-                    if 'cookiefile' in ydl_opts_without_cookies:
-                        del ydl_opts_without_cookies['cookiefile']
+            # Cache configuration
+            if self.config['use_yt_dlp_cache']:
+                cache_dir = os.path.join(self.config['temp_dir'], 'yt_dlp_cache')
+                os.makedirs(cache_dir, exist_ok=True)
+                ydl_opts['cachedir'] = cache_dir
+        
+        return ydl_opts
+    
+    async def download_video_with_retry(self, url: str, video_info: Dict, temp_dir: str, max_retries: int = 3) -> Optional[Dict]:
+        """Download video with retry logic"""
+        for attempt in range(max_retries):
+            try:
+                base_ydl_opts = self.get_ydl_opts(for_info=False, attempt=attempt)
+                base_ydl_opts['outtmpl'] = os.path.join(temp_dir, '%(title)s.%(ext)s')
+                base_ydl_opts['progress_hooks'] = [self.download_progress_hook]
+                
+                formats = self.select_format(video_info['formats'], attempt)
+                ydl_opts = base_ydl_opts.copy()
+                ydl_opts['format'] = formats['primary']
+                
+                return await self._download_with_opts(url, ydl_opts, temp_dir)
+                
+            except Exception as e:
+                error_msg = str(e).lower()
+                logger.warning(f"Download attempt {attempt+1} failed: {error_msg[:200]}")
+                
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # Exponential backoff
+                    await asyncio.sleep(wait_time)
                     
-                    with yt_dlp.YoutubeDL(ydl_opts_without_cookies) as ydl:
-                        info = ydl.extract_info(url, download=False)
-                        if info:
-                            if 'entries' in info:
-                                info = info['entries'][0]
-                            video_info = {
-                                'id': info.get('id'),
-                                'title': self.sanitize_filename(info.get('title', 'video')),
-                                'duration': info.get('duration', 0),
-                                'uploader': info.get('uploader', 'Unknown'),
-                                'formats': info.get('formats', []),
-                                'description': info.get('description', '')[:200],
-                                'webpage_url': info.get('webpage_url', url),
-                                'thumbnail': info.get('thumbnail'),
-                                'age_limit': info.get('age_limit', 0),
-                            }
-                            logger.info(f"Video info fetched without cookies: {video_info['title']}")
-                            return video_info
-                except Exception as e2:
-                    logger.error(f"Error getting video info without cookies: {e2}")
-            
-            return None
+                    # Try fallback format on retry
+                    try:
+                        ydl_opts = base_ydl_opts.copy()
+                        ydl_opts['format'] = formats['fallback']
+                        return await self._download_with_opts(url, ydl_opts, temp_dir)
+                    except Exception as e2:
+                        logger.warning(f"Fallback download also failed: {e2}")
+                        continue
+                else:
+                    logger.error(f"All {max_retries} download attempts failed")
+                    raise Exception(f"Download failed after {max_retries} attempts: {str(e)[:100]}")
+        
+        return None
+    
+    def select_format(self, formats: list, attempt: int = 0) -> Dict:
+        """Select best format based on rules and attempt"""
+        if attempt == 0:
+            # First attempt: try for 720p with audio
+            format_primary = "bestvideo[height<=720]+bestaudio/best[height<=720]"
+        elif attempt == 1:
+            # Second attempt: try for any video with audio
+            format_primary = "bestvideo+bestaudio/best"
+        else:
+            # Third attempt: just get whatever works
+            format_primary = "best"
+        
+        # Fallback: simplest format
+        format_fallback = "best"
+        
+        return {
+            'primary': format_primary,
+            'fallback': format_fallback
+        }
     
     def sanitize_filename(self, filename: str) -> str:
         """Sanitize filename for safe filesystem usage"""
@@ -1046,44 +1119,6 @@ class YouTubeDownloaderBot:
         # Limit length
         filename = filename[:100]
         return filename.strip()
-    
-    async def download_video(self, url: str, video_info: Dict, temp_dir: str) -> Optional[Dict]:
-        """Download video using yt-dlp"""
-        base_ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
-            'progress_hooks': [self.download_progress_hook],
-            'socket_timeout': 30,
-            'retries': 3,
-            'fragment_retries': 3,
-            'extractor_args': {'youtube': {'skip': ['hls', 'dash']}},
-        }
-        
-        # Add cookies if available
-        if self.cookies_available:
-            base_ydl_opts['cookiefile'] = self.config['cookies_path']
-            logger.info("Using cookies for download")
-        
-        formats = self.select_format(video_info['formats'])
-        ydl_opts = base_ydl_opts.copy()
-        ydl_opts['format'] = formats['primary']
-        
-        try:
-            return await self._download_with_opts(url, ydl_opts, temp_dir)
-            
-        except Exception as e:
-            error_msg = str(e).lower()
-            logger.error(f"Download failed: {error_msg[:200]}")
-            
-            # Try fallback format
-            try:
-                ydl_opts = base_ydl_opts.copy()
-                ydl_opts['format'] = formats['fallback']
-                return await self._download_with_opts(url, ydl_opts, temp_dir)
-            except Exception as e2:
-                logger.error(f"Fallback download also failed: {e2}")
-                raise Exception(f"Download failed: {str(e)[:100]}")
     
     async def _download_with_opts(self, url: str, ydl_opts: Dict, temp_dir: str) -> Dict:
         """Execute yt-dlp with given options"""
@@ -1119,18 +1154,6 @@ class YouTubeDownloaderBot:
             logger.debug(f"Download: {percent} at {speed}, ETA: {eta}")
         elif d['status'] == 'finished':
             logger.info("Download completed")
-    
-    def select_format(self, formats: list) -> Dict:
-        """Select best format based on rules"""
-        # Try: bestvideo(height<=720) + bestaudio
-        format_primary = "bestvideo[height<=720]+bestaudio/best[height<=720]"
-        # Fallback: best
-        format_fallback = "best"
-        
-        return {
-            'primary': format_primary,
-            'fallback': format_fallback
-        }
     
     async def process_downloaded_files(self, files: Dict, temp_dir: str) -> Optional[str]:
         """Process downloaded files (merge if needed)"""
@@ -1347,3 +1370,4 @@ if __name__ == "__main__":
         print("\nBot stopped by user")
     except Exception as e:
         print(f"Fatal error: {e}")
+[file content end]
