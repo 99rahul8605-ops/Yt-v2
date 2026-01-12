@@ -5,6 +5,7 @@ import shutil
 import json
 import logging
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime
@@ -36,6 +37,7 @@ class YouTubeDownloaderBot:
         self.admin_ids = self.get_admin_ids()
         self.runner = None
         self.cookie_upload_states = {}  # Track cookie upload states
+        self.download_states = {}  # Track download states for each user
         
         # Initialize cookies
         self.check_cookies_file()
@@ -55,7 +57,9 @@ class YouTubeDownloaderBot:
             'max_concurrent': int(os.getenv('MAX_CONCURRENT_DOWNLOADS', '1')),
             'temp_dir': os.getenv('TEMP_DIR', '/tmp/ytdl'),
             'port': int(os.getenv('PORT', '10000')),
-            'proxy_url': os.getenv('PROXY_URL', ''),  # Add proxy support
+            'proxy_url': os.getenv('PROXY_URL', ''),
+            'max_retries': int(os.getenv('MAX_RETRIES', '3')),
+            'fragment_retries': int(os.getenv('FRAGMENT_RETRIES', '25')),
         }
         
         # Create directories
@@ -399,19 +403,22 @@ class YouTubeDownloaderBot:
                 "🎬 **YouTube Video Downloader Bot**\n\n"
                 "**📋 Commands:**\n"
                 "• /yt - Download a YouTube video\n"
+                "• /batch - Download multiple videos from text file\n"
                 "• /status - Check bot status\n"
                 "• /cookies_status - Check cookies status\n"
+                "• /stop - Cancel current download\n"
                 "• /help - Show this message"
                 f"{admin_commands}"
                 "\n\n**⚙️ Limits:**\n"
                 f"• Max duration: {self.config['max_duration']//60} minutes\n"
-                "• Max resolution: 720p\n"
-                "• Format: MP4\n\n"
+                "• Supported resolutions: 144p, 240p, 360p, 480p, 720p, 1080p\n"
+                "• Format: MP4/MKV\n\n"
                 f"**🍪 Cookies Status:** {cookies_status}\n"
                 "• Age-restricted videos require cookies\n\n"
                 "**📖 Usage:**\n"
                 "1. Send /yt\n"
-                "2. Reply with a YouTube URL"
+                "2. Reply with a YouTube URL\n"
+                "3. Select resolution (default: 720p)"
             )
         
         @self.app.on_message(filters.command("yt"))
@@ -435,16 +442,117 @@ class YouTubeDownloaderBot:
                 return
             
             self.user_states[user_id] = {"state": "waiting_for_url", "message_id": message.id}
-            await message.reply(
-                "🔗 **Please send me a YouTube URL**\n\n"
-                "**Send /cancel to abort the operation.**\n\n"
-                "**Supported URLs:**\n"
-                "• youtube.com/watch?v=...\n"
-                "• youtu.be/...\n"
-                "• youtube.com/shorts/...\n"
-                "• youtube.com/playlist?list=... (first video only)\n\n"
-                f"**Cookies:** {'✅ Active' if self.cookies_available else '❌ Not configured'}"
+            
+            # Ask for resolution
+            resolution_keyboard = InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("144p", callback_data="res_144"),
+                     InlineKeyboardButton("240p", callback_data="res_240"),
+                     InlineKeyboardButton("360p", callback_data="res_360")],
+                    [InlineKeyboardButton("480p", callback_data="res_480"),
+                     InlineKeyboardButton("720p", callback_data="res_720"),
+                     InlineKeyboardButton("1080p", callback_data="res_1080")],
+                    [InlineKeyboardButton("Best Available", callback_data="res_best"),
+                     InlineKeyboardButton("Cancel", callback_data="res_cancel")]
+                ]
             )
+            
+            await message.reply(
+                "📏 **Please select video resolution:**\n\n"
+                "Or send the resolution number (144, 240, 360, 480, 720, 1080)\n"
+                "Send 'best' for best available quality\n\n"
+                f"**Cookies:** {'✅ Active' if self.cookies_available else '❌ Not configured'}\n"
+                "**Send /cancel to abort.**",
+                reply_markup=resolution_keyboard
+            )
+        
+        @self.app.on_message(filters.command("batch"))
+        async def batch_command(client, message: Message):
+            """Handle batch download from text file"""
+            if not await self.check_user_access(message.from_user.id):
+                await message.reply("❌ You are not authorized to use this bot.")
+                return
+            
+            user_id = message.from_user.id
+            
+            # Check concurrent downloads limit
+            active_count = sum(1 for uid in self.active_downloads.values() if uid == user_id)
+            if active_count >= self.config['max_concurrent']:
+                await message.reply("⏳ You have too many active downloads. Please wait for them to complete.")
+                return
+            
+            # Check if user is already in a process
+            if user_id in self.user_states:
+                await message.reply("⏳ Please finish your current download first.")
+                return
+            
+            self.user_states[user_id] = {"state": "waiting_for_batch", "message_id": message.id}
+            
+            await message.reply(
+                "📁 **Batch Download**\n\n"
+                "Please send me a text file (.txt) containing YouTube URLs (one per line).\n\n"
+                "**Format:**\n"
+                "https://youtube.com/watch?v=...\n"
+                "https://youtu.be/...\n"
+                "https://youtube.com/shorts/...\n\n"
+                "**Send /cancel to abort.**"
+            )
+        
+        @self.app.on_message(filters.command("stop"))
+        async def stop_command(client, message: Message):
+            """Stop current download"""
+            user_id = message.from_user.id
+            
+            if user_id in self.download_states:
+                self.download_states[user_id]['cancelled'] = True
+                await message.reply("⏹️ Download stopped. Cleaning up...")
+            elif user_id in self.user_states:
+                del self.user_states[user_id]
+                await message.reply("❌ Operation cancelled.")
+            else:
+                await message.reply("❌ No active download to stop.")
+        
+        @self.app.on_callback_query()
+        async def handle_callback_query(client, callback_query):
+            """Handle callback queries"""
+            user_id = callback_query.from_user.id
+            data = callback_query.data
+            
+            if data.startswith("res_"):
+                if user_id not in self.user_states:
+                    await callback_query.answer("Session expired. Please start again with /yt", show_alert=True)
+                    return
+                
+                if data == "res_cancel":
+                    del self.user_states[user_id]
+                    await callback_query.message.edit_text("❌ Operation cancelled.")
+                    await callback_query.answer()
+                    return
+                
+                # Store resolution and ask for URL
+                resolution = data.replace("res_", "")
+                if resolution == "best":
+                    resolution = "best"
+                else:
+                    resolution = resolution.replace("p", "")
+                
+                self.user_states[user_id] = {
+                    "state": "waiting_for_url",
+                    "resolution": resolution,
+                    "message_id": callback_query.message.id
+                }
+                
+                await callback_query.message.edit_text(
+                    f"📏 **Resolution selected:** {resolution if resolution == 'best' else resolution + 'p'}\n\n"
+                    "🔗 **Now send me the YouTube URL**\n\n"
+                    "**Supported URLs:**\n"
+                    "• youtube.com/watch?v=...\n"
+                    "• youtu.be/...\n"
+                    "• youtube.com/shorts/...\n"
+                    "• youtube.com/playlist?list=... (first video only)\n\n"
+                    "**Send /cancel to abort.**"
+                )
+                await callback_query.answer()
         
         @self.app.on_message(filters.command("status"))
         async def status_command(client, message: Message):
@@ -791,14 +899,15 @@ class YouTubeDownloaderBot:
         
         @self.app.on_callback_query()
         async def handle_callback_query(client, callback_query):
-            """Handle callback queries for cookies deletion"""
+            """Handle callback queries"""
             user_id = callback_query.from_user.id
+            data = callback_query.data
             
-            if not await self.check_admin_access(user_id):
-                await callback_query.answer("Admin access required.", show_alert=True)
-                return
-            
-            if callback_query.data == "delete_cookies_yes":
+            if data == "delete_cookies_yes":
+                if not await self.check_admin_access(user_id):
+                    await callback_query.answer("Admin access required.", show_alert=True)
+                    return
+                
                 try:
                     # Backup first
                     self.backup_current_cookies()
@@ -823,7 +932,7 @@ class YouTubeDownloaderBot:
                 except Exception as e:
                     await callback_query.message.edit_text(f"❌ Error deleting cookies: {str(e)[:200]}")
                     
-            elif callback_query.data == "delete_cookies_no":
+            elif data == "delete_cookies_no":
                 await callback_query.message.edit_text("✅ Cookies deletion cancelled.")
             
             await callback_query.answer()
@@ -836,6 +945,20 @@ class YouTubeDownloaderBot:
             if user_id in self.user_states:
                 del self.user_states[user_id]
                 await message.reply("❌ Operation cancelled.")
+            
+            if user_id in self.cookie_upload_states:
+                del self.cookie_upload_states[user_id]
+                await message.reply("❌ Cookies upload cancelled.")
+        
+        # Handle document messages (for batch upload)
+        @self.app.on_message(filters.document)
+        async def handle_document(client, message: Message):
+            """Handle document uploads (for batch .txt files)"""
+            user_id = message.from_user.id
+            
+            # Check if user is in batch upload state
+            if user_id in self.user_states and self.user_states[user_id].get("state") == "waiting_for_batch":
+                await self.handle_batch_upload(message)
         
         # Handle text messages
         @self.app.on_message(filters.text)
@@ -852,22 +975,64 @@ class YouTubeDownloaderBot:
             if user_id in self.user_states:
                 user_state = self.user_states[user_id]
                 
-                if isinstance(user_state, dict) and user_state.get("state") == "waiting_for_url":
+                if user_state.get("state") == "waiting_for_url":
                     logger.info(f"User {user_id} is waiting for URL, processing...")
+                    
+                    # Check if text is a resolution number
+                    if text.isdigit() and int(text) in [144, 240, 360, 480, 720, 1080]:
+                        # Store resolution and ask for URL
+                        self.user_states[user_id] = {
+                            "state": "waiting_for_url",
+                            "resolution": text,
+                            "message_id": user_state.get("message_id")
+                        }
+                        
+                        await message.reply(
+                            f"📏 **Resolution set to {text}p**\n\n"
+                            "🔗 **Now send me the YouTube URL**\n\n"
+                            "**Supported URLs:**\n"
+                            "• youtube.com/watch?v=...\n"
+                            "• youtu.be/...\n"
+                            "• youtube.com/shorts/...\n"
+                            "• youtube.com/playlist?list=... (first video only)\n\n"
+                            "**Send /cancel to abort.**"
+                        )
+                        return
+                    elif text.lower() == "best":
+                        # Store best resolution and ask for URL
+                        self.user_states[user_id] = {
+                            "state": "waiting_for_url",
+                            "resolution": "best",
+                            "message_id": user_state.get("message_id")
+                        }
+                        
+                        await message.reply(
+                            "📏 **Resolution set to Best Available**\n\n"
+                            "🔗 **Now send me the YouTube URL**\n\n"
+                            "**Supported URLs:**\n"
+                            "• youtube.com/watch?v=...\n"
+                            "• youtu.be/...\n"
+                            "• youtube.com/shorts/...\n"
+                            "• youtube.com/playlist?list=... (first video only)\n\n"
+                            "**Send /cancel to abort.**"
+                        )
+                        return
                     
                     # Validate URL
                     if not self.validate_youtube_url(text):
                         await message.reply("❌ Invalid YouTube URL. Please send a valid YouTube link.")
-                        del self.user_states[user_id]
                         return
                     
                     logger.info(f"URL validated: {text}")
+                    
+                    # Get resolution from user state or default to 720
+                    resolution = user_state.get("resolution", "720")
                     
                     # Remove user from waiting state immediately
                     del self.user_states[user_id]
                     
                     # Start processing in background
-                    asyncio.create_task(self.process_video(message, text))
+                    asyncio.create_task(self.process_video(message, text, resolution))
                     return
             
             # If not waiting for URL and text looks like a YouTube URL, suggest using /yt
@@ -876,9 +1041,90 @@ class YouTubeDownloaderBot:
                     "🔗 **I see you sent a YouTube URL!**\n\n"
                     "To download videos, please use the /yt command first:\n"
                     "1. Send /yt\n"
-                    "2. Then send the URL\n\n"
+                    "2. Select resolution\n"
+                    "3. Then send the URL\n\n"
                     "This helps me keep track of your request."
                 )
+    
+    async def handle_batch_upload(self, message: Message):
+        """Handle batch .txt file upload"""
+        user_id = message.from_user.id
+        
+        # Check if document is valid
+        document = message.document
+        if not document:
+            await message.reply("❌ Please send a file, not text.")
+            del self.user_states[user_id]
+            return
+        
+        # Check file name
+        if not document.file_name.endswith('.txt'):
+            await message.reply("❌ File must be a .txt file")
+            del self.user_states[user_id]
+            return
+        
+        status_msg = await message.reply("📥 Downloading batch file...")
+        
+        try:
+            # Download the file
+            temp_dir = tempfile.mkdtemp()
+            temp_path = os.path.join(temp_dir, "batch_temp.txt")
+            
+            await message.download(temp_path)
+            
+            # Read URLs from file
+            with open(temp_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            
+            lines = [line.strip() for line in content.split('\n') if line.strip()]
+            youtube_urls = [line for line in lines if self.validate_youtube_url(line)]
+            
+            if not youtube_urls:
+                await status_msg.edit_text("❌ No valid YouTube URLs found in the file.")
+                shutil.rmtree(temp_dir)
+                del self.user_states[user_id]
+                return
+            
+            # Ask for resolution
+            resolution_keyboard = InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("144p", callback_data="batch_res_144"),
+                     InlineKeyboardButton("240p", callback_data="batch_res_240"),
+                     InlineKeyboardButton("360p", callback_data="batch_res_360")],
+                    [InlineKeyboardButton("480p", callback_data="batch_res_480"),
+                     InlineKeyboardButton("720p", callback_data="batch_res_720"),
+                     InlineKeyboardButton("1080p", callback_data="batch_res_1080")],
+                    [InlineKeyboardButton("Best Available", callback_data="batch_res_best"),
+                     InlineKeyboardButton("Cancel", callback_data="batch_res_cancel")]
+                ]
+            )
+            
+            # Store batch data
+            self.user_states[user_id] = {
+                "state": "waiting_for_batch_resolution",
+                "urls": youtube_urls,
+                "temp_dir": temp_dir,
+                "temp_path": temp_path
+            }
+            
+            await status_msg.edit_text(
+                f"✅ **Found {len(youtube_urls)} valid YouTube URLs**\n\n"
+                "📏 **Please select video resolution for all downloads:**\n\n"
+                "Or send the resolution number (144, 240, 360, 480, 720, 1080)\n"
+                "Send 'best' for best available quality\n\n"
+                "**Send /cancel to abort.**",
+                reply_markup=resolution_keyboard
+            )
+            
+        except Exception as e:
+            logger.error(f"Error handling batch upload: {e}")
+            await status_msg.edit_text(f"❌ Error processing batch file: {str(e)[:200]}")
+            if 'temp_dir' in locals():
+                try:
+                    shutil.rmtree(temp_dir)
+                except:
+                    pass
+            del self.user_states[user_id]
     
     def validate_youtube_url(self, url: str) -> bool:
         """Validate YouTube URL with improved patterns"""
@@ -908,73 +1154,197 @@ class YouTubeDownloaderBot:
         
         return False
     
-    async def process_video(self, message: Message, url: str):
-        """Main processing pipeline"""
+    async def process_video(self, message: Message, url: str, resolution: str = "720"):
+        """Main processing pipeline with enhanced logic from drm_handler.py"""
         user_id = message.from_user.id
         task_id = f"{user_id}_{int(asyncio.get_event_loop().time())}"
         
         try:
             # Track active download
             self.active_downloads[task_id] = user_id
+            self.download_states[user_id] = {'cancelled': False}
             
-            status_msg = await message.reply("⏳ Processing your request...")
+            # Sanitize URL
+            url = url.replace("file/d/", "uc?export=download&id=").replace("www.youtube-nocookie.com/embed", "youtu.be")
+            
+            # Get video title from oembed for YouTube
+            video_title = ""
+            if "youtu" in url:
+                try:
+                    oembed_url = f"https://www.youtube.com/oembed?url={url}&format=json"
+                    import requests
+                    response = requests.get(oembed_url)
+                    if response.status_code == 200:
+                        video_title = response.json().get('title', 'YouTube Video')
+                        video_title = video_title.replace("_", " ")[:60]
+                except:
+                    pass
             
             # Create user-specific temp directory
-            user_temp_dir = os.path.join(self.config['temp_dir'], f"user_{user_id}")
+            user_temp_dir = os.path.join(self.config['temp_dir'], f"user_{user_id}_{int(time.time())}")
             os.makedirs(user_temp_dir, exist_ok=True)
             
-            # Step 1: Fetch video info with retry
-            await self.update_status(status_msg, "📥 Fetching video information...")
-            video_info = await self.get_video_info_with_retry(url)
+            # Build yt-dlp command based on resolution
+            if resolution == "best":
+                ytf = "bv*+ba/b"
+            else:
+                # Enhanced format selection from drm_handler.py
+                ytf = f"bv*[height<={resolution}][ext=mp4]+ba[ext=m4a]/b[height<=?{resolution}]"
             
-            if not video_info:
-                error_msg = "❌ Failed to fetch video information."
-                if not self.cookies_available:
-                    error_msg += "\n\n⚠️ **Cookies not configured!**\nSome videos (especially age-restricted ones) require cookies to work."
-                else:
-                    error_msg += "\n\nPossible reasons:\n• Video is private/removed\n• Region restricted\n• Requires age verification"
+            # Create filename
+            if video_title:
+                name = self.sanitize_filename(video_title)
+            else:
+                # Extract from URL
+                name = "video"
+                if "youtu.be/" in url:
+                    name = url.split("youtu.be/")[1][:50]
+                elif "youtube.com/watch?v=" in url:
+                    name = url.split("youtube.com/watch?v=")[1][:50]
+                name = self.sanitize_filename(name)
+            
+            # Build yt-dlp command
+            cmd_parts = [
+                'yt-dlp',
+                '--no-warnings',
+                '-R', str(self.config['max_retries']),
+                '--fragment-retries', str(self.config['fragment_retries']),
+                '-f', f'"{ytf}"',
+                '--merge-output-format', 'mp4',
+                '-o', f'"{user_temp_dir}/{name}.%(ext)s"',
+            ]
+            
+            # Add cookies if available
+            if self.cookies_available:
+                cmd_parts.extend(['--cookies', self.config['cookies_path']])
+            
+            # Add proxy if configured
+            if self.config.get('proxy_url'):
+                cmd_parts.extend(['--proxy', self.config['proxy_url']])
+            
+            # Add URL
+            cmd_parts.append(f'"{url}"')
+            
+            cmd = ' '.join(cmd_parts)
+            
+            # Send progress message
+            progress_msg = await message.reply(
+                f"⏳ **Processing Video**\n\n"
+                f"**Title:** {video_title or 'Fetching...'}\n"
+                f"**Resolution:** {resolution if resolution == 'best' else resolution + 'p'}\n"
+                f"**URL:** [Click Here]({url})\n\n"
+                f"🔄 Downloading...\n\n"
+                f"**Send /stop to cancel**"
+            )
+            
+            # Execute download
+            process = await asyncio.create_subprocess_shell(
+                cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                shell=True
+            )
+            
+            # Monitor process
+            while True:
+                if self.download_states.get(user_id, {}).get('cancelled'):
+                    process.terminate()
+                    await progress_msg.edit_text("⏹️ Download cancelled. Cleaning up...")
+                    break
                 
-                await status_msg.edit_text(error_msg)
+                try:
+                    await asyncio.wait_for(process.communicate(), timeout=1)
+                except asyncio.TimeoutError:
+                    continue
+                else:
+                    break
+            
+            if self.download_states.get(user_id, {}).get('cancelled'):
+                # Cleanup
+                shutil.rmtree(user_temp_dir, ignore_errors=True)
+                if user_id in self.download_states:
+                    del self.download_states[user_id]
+                if task_id in self.active_downloads:
+                    del self.active_downloads[task_id]
                 return
             
-            # Step 2: Check duration limit
-            duration = video_info.get('duration', 0)
-            max_duration = self.config['max_duration']
-            if duration > max_duration:
-                await status_msg.edit_text(
-                    f"❌ Video is too long ({duration//60} minutes). "
-                    f"Maximum allowed duration is {max_duration//60} minutes."
-                )
+            # Check if download was successful
+            output_files = list(Path(user_temp_dir).glob('*.mp4'))
+            if not output_files:
+                # Try other extensions
+                output_files = list(Path(user_temp_dir).glob('*.*'))
+            
+            if not output_files:
+                await progress_msg.edit_text("❌ Download failed. No video file found.")
                 return
             
-            # Step 3: Download video
-            await self.update_status(status_msg, f"⬇️ Downloading: {video_info['title'][:50]}...")
-            downloaded_files = await self.download_video(url, video_info, user_temp_dir)
+            video_path = str(output_files[0])
             
-            if not downloaded_files:
-                error_msg = "❌ Failed to download video."
-                if not self.cookies_available and video_info.get('age_limit', 0) > 0:
-                    error_msg += "\n\n⚠️ This appears to be an age-restricted video. Cookies are required to download age-restricted content."
-                await status_msg.edit_text(error_msg)
-                return
-            
-            # Step 4: Process files
-            await self.update_status(status_msg, "🔄 Processing video...")
-            final_video = await self.process_downloaded_files(downloaded_files, user_temp_dir)
-            
-            if not final_video:
-                await status_msg.edit_text("❌ Failed to process video files.")
-                return
-            
-            # Step 5: Generate thumbnail
-            await self.update_status(status_msg, "🖼️ Generating thumbnail...")
-            thumbnail = await self.generate_thumbnail(final_video)
-            
-            # Step 6: Upload to Telegram
-            await self.update_status(status_msg, "📤 Uploading to Telegram...")
-            await self.upload_to_telegram(message, final_video, thumbnail, video_info)
-            
-            await status_msg.edit_text("✅ Video sent successfully!")
+            # Get video info for Telegram upload
+            try:
+                probe = ffmpeg.probe(video_path)
+                duration = int(float(probe['format']['duration']))
+                file_size = os.path.getsize(video_path)
+                
+                # Generate thumbnail
+                thumbnail_path = await self.generate_thumbnail(video_path)
+                
+                # Check file size limit
+                max_size = self.config['max_file_size']
+                if file_size > max_size:
+                    await progress_msg.edit_text(
+                        f"❌ Video file too large ({file_size//(1024*1024)}MB). "
+                        f"Max allowed: {max_size//(1024*1024)}MB."
+                    )
+                    return
+                
+                # Upload to Telegram
+                caption = f"**{video_title or name}**\n\n"
+                caption += f"📏 **Resolution:** {resolution if resolution == 'best' else resolution + 'p'}\n"
+                caption += f"⏱️ **Duration:** {duration//60}:{duration%60:02d}\n"
+                caption += f"📊 **Size:** {file_size//(1024*1024)}MB\n"
+                caption += f"🔗 **Source:** [YouTube]({url})"
+                
+                await progress_msg.edit_text("📤 Uploading to Telegram...")
+                
+                # Try to send as video first
+                try:
+                    await self.app.send_video(
+                        chat_id=message.chat.id,
+                        video=video_path,
+                        caption=caption,
+                        duration=duration,
+                        thumb=thumbnail_path,
+                        supports_streaming=True
+                    )
+                    await progress_msg.edit_text("✅ Video sent successfully!")
+                    
+                except FloodWait as e:
+                    await asyncio.sleep(e.value + 1)
+                    # Retry once
+                    await self.app.send_video(
+                        chat_id=message.chat.id,
+                        video=video_path,
+                        caption=caption,
+                        duration=duration,
+                        thumb=thumbnail_path,
+                        supports_streaming=True
+                    )
+                    await progress_msg.edit_text("✅ Video sent successfully!")
+                    
+                except RPCError:
+                    # Fallback to document
+                    await self.app.send_document(
+                        chat_id=message.chat.id,
+                        document=video_path,
+                        caption=caption,
+                        thumb=thumbnail_path
+                    )
+                    await progress_msg.edit_text("✅ Video sent as document!")
+                    
+            except Exception as upload_error:
+                logger.error(f"Upload error: {upload_error}")
+                await progress_msg.edit_text(f"❌ Upload failed: {str(upload_error)[:200]}")
             
         except Exception as e:
             logger.error(f"Error processing video: {e}", exc_info=True)
@@ -1009,306 +1379,21 @@ class YouTubeDownloaderBot:
             # Cleanup
             if task_id in self.active_downloads:
                 del self.active_downloads[task_id]
+            if user_id in self.download_states:
+                del self.download_states[user_id]
             await self.cleanup_user_files(user_id)
-    
-    async def get_video_info_with_retry(self, url: str, max_retries: int = 3) -> Optional[Dict]:
-        """Fetch video info with retry logic"""
-        for attempt in range(max_retries):
-            try:
-                logger.info(f"Fetching video info (attempt {attempt + 1}/{max_retries})")
-                info = await self.get_video_info(url)
-                if info:
-                    return info
-                
-                # Wait before retrying
-                wait_time = 2 ** attempt  # Exponential backoff: 1, 2, 4, 8 seconds
-                logger.info(f"Attempt {attempt + 1} failed, waiting {wait_time}s before retry...")
-                await asyncio.sleep(wait_time)
-                
-            except Exception as e:
-                logger.error(f"Attempt {attempt + 1} failed with error: {e}")
-                if attempt == max_retries - 1:
-                    raise
-                wait_time = 2 ** attempt
-                await asyncio.sleep(wait_time)
-        
-        return None
-    
-    async def get_video_info(self, url: str) -> Optional[Dict]:
-        """Fetch video metadata using yt-dlp"""
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'extract_flat': False,
-            'socket_timeout': 30,
-            'extractor_args': {'youtube': {'skip': ['hls', 'dash']}},
-            # Add comprehensive headers to mimic real browser
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Accept-Encoding': 'gzip, deflate',
-                'DNT': '1',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1',
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'none',
-                'Sec-Fetch-User': '?1',
-                'Cache-Control': 'max-age=0',
-            },
-            'compat_opts': {
-                'no-youtube-unavailable-videos': True,
-            },
-            # Add rate limiting to avoid detection
-            'ratelimit': 1048576,  # 1 MB/s
-            'throttledratelimit': 524288,  # 0.5 MB/s
-            'sleep_interval_requests': 1,
-            'sleep_interval': 5,
-            'max_sleep_interval': 15,
-            'sleep_interval_subtitles': 1,
-        }
-        
-        # Add proxy if configured
-        if self.config.get('proxy_url'):
-            ydl_opts['proxy'] = self.config['proxy_url']
-        
-        # Add cookies if available
-        if self.cookies_available:
-            ydl_opts['cookiefile'] = self.config['cookies_path']
-            logger.info("Using cookies for video info fetch")
-        
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                # First try with verbose logging to see what's happening
-                logger.info(f"Attempting to extract info from: {url}")
-                info = ydl.extract_info(url, download=False)
-                
-                if not info:
-                    return None
-                
-                # Handle playlists (take first video)
-                if 'entries' in info:
-                    info = info['entries'][0]
-                
-                # Format the info
-                video_info = {
-                    'id': info.get('id'),
-                    'title': self.sanitize_filename(info.get('title', 'video')),
-                    'duration': info.get('duration', 0),
-                    'uploader': info.get('uploader', 'Unknown'),
-                    'formats': info.get('formats', []),
-                    'description': info.get('description', '')[:200],
-                    'webpage_url': info.get('webpage_url', url),
-                    'thumbnail': info.get('thumbnail'),
-                    'age_limit': info.get('age_limit', 0),
-                    'view_count': info.get('view_count', 0),
-                    'like_count': info.get('like_count', 0),
-                }
-                
-                logger.info(f"Video info fetched: {video_info['title']} ({video_info['duration']}s), Age limit: {video_info['age_limit']}")
-                return video_info
-                
-        except yt_dlp.utils.DownloadError as e:
-            logger.error(f"yt-dlp DownloadError: {e}")
-            
-            # Try alternative extraction method for problematic videos
-            try:
-                logger.info("Trying alternative extraction method...")
-                ydl_opts_alt = ydl_opts.copy()
-                ydl_opts_alt['extractor_args'] = {'youtube': {
-                    'skip': ['hls', 'dash'],
-                    'player_client': ['android', 'web'],
-                }}
-                ydl_opts_alt['extract_flat'] = True
-                
-                with yt_dlp.YoutubeDL(ydl_opts_alt) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    if info and 'entries' in info:
-                        info = info['entries'][0]
-                    
-                    if info:
-                        video_info = {
-                            'id': info.get('id'),
-                            'title': self.sanitize_filename(info.get('title', 'video')),
-                            'duration': info.get('duration', 0),
-                            'uploader': info.get('uploader', 'Unknown'),
-                            'formats': [],
-                            'description': info.get('description', '')[:200],
-                            'webpage_url': info.get('webpage_url', url),
-                            'thumbnail': info.get('thumbnail'),
-                            'age_limit': info.get('age_limit', 0),
-                        }
-                        logger.info(f"Video info fetched via alternative method: {video_info['title']}")
-                        return video_info
-            except Exception as e2:
-                logger.error(f"Alternative extraction also failed: {e2}")
-            
-            return None
-        except Exception as e:
-            logger.error(f"Error getting video info: {e}")
-            return None
     
     def sanitize_filename(self, filename: str) -> str:
         """Sanitize filename for safe filesystem usage"""
         # Remove invalid characters
         filename = re.sub(r'[<>:"/\\|?*]', '', filename)
+        # Remove emojis and special characters
+        filename = re.sub(r'[^\w\s-]', '', filename)
+        # Replace multiple spaces with single space
+        filename = re.sub(r'\s+', ' ', filename)
         # Limit length
         filename = filename[:100]
         return filename.strip()
-    
-    async def download_video(self, url: str, video_info: Dict, temp_dir: str) -> Optional[Dict]:
-        """Download video using yt-dlp"""
-        base_ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
-            'progress_hooks': [self.download_progress_hook],
-            'socket_timeout': 30,
-            'retries': 3,
-            'fragment_retries': 3,
-            'extractor_args': {'youtube': {'skip': ['hls', 'dash']}},
-            # Add comprehensive headers
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Accept-Encoding': 'gzip, deflate',
-                'DNT': '1',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1',
-            },
-            # Rate limiting
-            'ratelimit': 1048576,  # 1 MB/s
-            'throttledratelimit': 524288,  # 0.5 MB/s
-            'sleep_interval_requests': 1,
-            'sleep_interval': 5,
-            'max_sleep_interval': 15,
-        }
-        
-        # Add proxy if configured
-        if self.config.get('proxy_url'):
-            base_ydl_opts['proxy'] = self.config['proxy_url']
-        
-        # Add cookies if available
-        if self.cookies_available:
-            base_ydl_opts['cookiefile'] = self.config['cookies_path']
-            logger.info("Using cookies for download")
-        
-        formats = self.select_format(video_info['formats'])
-        ydl_opts = base_ydl_opts.copy()
-        ydl_opts['format'] = formats['primary']
-        
-        try:
-            return await self._download_with_opts(url, ydl_opts, temp_dir)
-            
-        except Exception as e:
-            error_msg = str(e).lower()
-            logger.error(f"Download failed: {error_msg[:200]}")
-            
-            # Try fallback format
-            try:
-                ydl_opts = base_ydl_opts.copy()
-                ydl_opts['format'] = formats['fallback']
-                return await self._download_with_opts(url, ydl_opts, temp_dir)
-            except Exception as e2:
-                logger.error(f"Fallback download also failed: {e2}")
-                raise Exception(f"Download failed: {str(e)[:100]}")
-    
-    async def _download_with_opts(self, url: str, ydl_opts: Dict, temp_dir: str) -> Dict:
-        """Execute yt-dlp with given options"""
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            
-            # Find downloaded files
-            downloaded_files = {
-                'video': None,
-                'audio': None,
-                'merged': None
-            }
-            
-            for file in Path(temp_dir).glob('*'):
-                if file.is_file():
-                    ext = file.suffix.lower()
-                    if ext in ['.mp4', '.mkv', '.webm', '.flv', '.avi']:
-                        # Check if it's likely a video file by size (> 100KB)
-                        if file.stat().st_size > 1024 * 100:
-                            downloaded_files['video'] = str(file)
-                    elif ext in ['.m4a', '.mp3', '.webm', '.opus', '.aac']:
-                        downloaded_files['audio'] = str(file)
-            
-            logger.info(f"Downloaded files: {downloaded_files}")
-            return downloaded_files
-    
-    def download_progress_hook(self, d):
-        """Progress hook for yt-dlp"""
-        if d['status'] == 'downloading':
-            percent = d.get('_percent_str', '0%').strip()
-            speed = d.get('_speed_str', 'N/A')
-            eta = d.get('_eta_str', 'N/A')
-            logger.debug(f"Download: {percent} at {speed}, ETA: {eta}")
-        elif d['status'] == 'finished':
-            logger.info("Download completed")
-    
-    def select_format(self, formats: list) -> Dict:
-        """Select best format based on rules"""
-        # Try: bestvideo(height<=720) + bestaudio
-        format_primary = "bestvideo[height<=720]+bestaudio/best[height<=720]"
-        # Fallback: best
-        format_fallback = "best"
-        
-        return {
-            'primary': format_primary,
-            'fallback': format_fallback
-        }
-    
-    async def process_downloaded_files(self, files: Dict, temp_dir: str) -> Optional[str]:
-        """Process downloaded files (merge if needed)"""
-        if files['video'] and files['audio']:
-            # Need to merge audio and video
-            logger.info("Merging audio and video streams")
-            return await self.merge_audio_video(files['video'], files['audio'], temp_dir)
-        elif files['video']:
-            # Already a single file
-            logger.info("Using single video file")
-            return files['video']
-        else:
-            logger.error("No video file found")
-            return None
-    
-    async def merge_audio_video(self, video_path: str, audio_path: str, temp_dir: str) -> Optional[str]:
-        """Merge audio and video streams using ffmpeg"""
-        output_path = os.path.join(temp_dir, "merged_video.mp4")
-        
-        try:
-            logger.info(f"Merging {video_path} and {audio_path} -> {output_path}")
-            
-            # Use ffmpeg to merge without re-encoding
-            input_video = ffmpeg.input(video_path)
-            input_audio = ffmpeg.input(audio_path)
-            
-            ffmpeg.output(
-                input_video,
-                input_audio,
-                output_path,
-                vcodec='copy',
-                acodec='copy',
-                **{'strict': 'experimental'}
-            ).run(quiet=True, overwrite_output=True, capture_stdout=True, capture_stderr=True)
-            
-            # Verify output
-            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                logger.info(f"Merged file created: {output_path} ({os.path.getsize(output_path)} bytes)")
-                return output_path
-            else:
-                logger.error("Merged file is empty or doesn't exist")
-            
-        except ffmpeg.Error as e:
-            logger.error(f"FFmpeg error: {e.stderr.decode() if e.stderr else str(e)}")
-        except Exception as e:
-            logger.error(f"Error merging files: {e}")
-        
-        return None
     
     async def generate_thumbnail(self, video_path: str) -> Optional[str]:
         """Generate thumbnail from video"""
@@ -1337,88 +1422,19 @@ class YouTubeDownloaderBot:
         
         return None
     
-    async def upload_to_telegram(self, message: Message, video_path: str, 
-                                thumbnail_path: Optional[str], video_info: Dict):
-        """Upload video to Telegram with fallback"""
-        try:
-            # Get video duration and size
-            probe = ffmpeg.probe(video_path)
-            duration = int(float(probe['format']['duration']))
-            file_size = os.path.getsize(video_path)
-            
-            logger.info(f"Uploading video: {file_size} bytes, {duration} seconds")
-            
-            # Check file size limit
-            max_size = self.config['max_file_size']
-            if file_size > max_size:
-                await message.reply(f"❌ Video file too large ({file_size//(1024*1024)}MB). Max allowed: {max_size//(1024*1024)}MB.")
-                return
-            
-            caption = f"**{video_info['title']}**\n\n📹 {video_info['uploader']}"
-            
-            # Progress callback
-            def progress(current, total):
-                percent = (current / total) * 100
-                if int(percent) % 10 == 0:  # Log every 10%
-                    logger.debug(f"Upload progress: {percent:.1f}% ({current}/{total})")
-            
-            # Try to send as video first
-            try:
-                await self.app.send_video(
-                    chat_id=message.chat.id,
-                    video=video_path,
-                    caption=caption,
-                    duration=duration,
-                    thumb=thumbnail_path,
-                    supports_streaming=True,
-                    progress=progress
-                )
-                logger.info("Video sent successfully")
-                
-            except FloodWait as e:
-                logger.warning(f"Flood wait: {e.value} seconds")
-                await asyncio.sleep(e.value + 1)
-                # Retry once
-                await self.app.send_video(
-                    chat_id=message.chat.id,
-                    video=video_path,
-                    caption=caption,
-                    duration=duration,
-                    thumb=thumbnail_path,
-                    supports_streaming=True
-                )
-                
-            except RPCError as e:
-                # Fallback to document
-                logger.warning(f"Video upload failed, sending as document: {e}")
-                await self.app.send_document(
-                    chat_id=message.chat.id,
-                    document=video_path,
-                    caption=caption,
-                    thumb=thumbnail_path,
-                    progress=progress
-                )
-                
-        except Exception as e:
-            logger.error(f"Upload error: {e}")
-            raise Exception(f"Upload failed: {str(e)[:100]}")
-    
-    async def update_status(self, message: Message, text: str):
-        """Update status message"""
-        try:
-            await message.edit_text(text)
-        except Exception as e:
-            logger.debug(f"Could not update status: {e}")
-    
     async def cleanup_user_files(self, user_id: int):
         """Clean up user's temporary files"""
-        user_dir = os.path.join(self.config['temp_dir'], f"user_{user_id}")
-        if os.path.exists(user_dir):
-            try:
-                shutil.rmtree(user_dir)
-                logger.info(f"Cleaned up temp files for user {user_id}")
-            except Exception as e:
-                logger.error(f"Error cleaning user files: {e}")
+        # Find all user directories
+        temp_dir = self.config['temp_dir']
+        for item in os.listdir(temp_dir):
+            if item.startswith(f"user_{user_id}_"):
+                user_dir = os.path.join(temp_dir, item)
+                if os.path.exists(user_dir):
+                    try:
+                        shutil.rmtree(user_dir)
+                        logger.info(f"Cleaned up temp files: {user_dir}")
+                    except Exception as e:
+                        logger.error(f"Error cleaning user files: {e}")
     
     async def run(self):
         """Main entry point - runs both web server and Telegram bot"""
