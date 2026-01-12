@@ -2,11 +2,9 @@ import os
 import asyncio
 import re
 import shutil
-import tempfile
 import logging
 from pathlib import Path
 from typing import Optional, Dict, Any
-from contextlib import asynccontextmanager
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -37,8 +35,8 @@ class YouTubeDownloaderBot:
             'api_hash': os.getenv('TELEGRAM_API_HASH', ''),
             'bot_token': os.getenv('TELEGRAM_BOT_TOKEN', ''),
             'cookies_path': os.getenv('YOUTUBE_COOKIES_PATH', ''),
-            'max_duration': int(os.getenv('MAX_DURATION', '3600')),  # 1 hour default
-            'max_file_size': int(os.getenv('MAX_FILE_SIZE', '2000000000')),  # 2GB
+            'max_duration': int(os.getenv('MAX_DURATION', '3600')),
+            'max_file_size': int(os.getenv('MAX_FILE_SIZE', '2000000000')),
             'allowed_users': os.getenv('ALLOWED_USERS', '').split(',') if os.getenv('ALLOWED_USERS') else [],
             'max_concurrent': int(os.getenv('MAX_CONCURRENT_DOWNLOADS', '2')),
             'temp_dir': os.getenv('TEMP_DIR', '/tmp/ytdl'),
@@ -57,7 +55,7 @@ class YouTubeDownloaderBot:
     async def check_user_access(self, user_id: int) -> bool:
         """Check if user is allowed to use bot"""
         if not self.config['allowed_users']:
-            return True  # No restrictions
+            return True
         
         return str(user_id) in self.config['allowed_users']
     
@@ -145,26 +143,30 @@ class YouTubeDownloaderBot:
         @self.app.on_message(filters.command("status"))
         async def status_command(client, message: Message):
             """Check bot status"""
-            import psutil
-            import platform
-            
-            # System info
-            cpu_percent = psutil.cpu_percent()
-            memory = psutil.virtual_memory()
-            disk = psutil.disk_usage('/')
-            
-            status_text = (
-                "🤖 **Bot Status**\n\n"
-                f"**System:** {platform.system()} {platform.release()}\n"
-                f"**CPU Usage:** {cpu_percent}%\n"
-                f"**Memory:** {memory.percent}% used\n"
-                f"**Disk:** {disk.percent}% used\n"
-                f"**Active Downloads:** {len(self.active_downloads)}\n"
-                f"**Temp Directory:** {self.config['temp_dir']}\n\n"
-                "✅ Bot is running normally"
-            )
-            
-            await message.reply(status_text)
+            try:
+                import psutil
+                import platform
+                
+                # System info
+                cpu_percent = psutil.cpu_percent()
+                memory = psutil.virtual_memory()
+                disk = psutil.disk_usage('/')
+                
+                status_text = (
+                    "🤖 **Bot Status**\n\n"
+                    f"**System:** {platform.system()} {platform.release()}\n"
+                    f"**CPU Usage:** {cpu_percent}%\n"
+                    f"**Memory:** {memory.percent}% used\n"
+                    f"**Disk:** {disk.percent}% used\n"
+                    f"**Active Downloads:** {len(self.active_downloads)}\n"
+                    f"**Temp Directory:** {self.config['temp_dir']}\n\n"
+                    "✅ Bot is running normally"
+                )
+                
+                await message.reply(status_text)
+            except Exception as e:
+                logger.error(f"Error in status command: {e}")
+                await message.reply("🤖 Bot is running normally")
         
         @self.app.on_message(filters.command("cancel"))
         async def cancel_command(client, message: Message):
@@ -174,7 +176,8 @@ class YouTubeDownloaderBot:
                 del self.user_states[user_id]
                 await message.reply("❌ Operation cancelled.")
         
-        @self.app.on_message(filters.text & ~filters.command)
+        # FIXED: Added parentheses to filters.command()
+        @self.app.on_message(filters.text & ~filters.command())
         async def handle_message(client, message: Message):
             """Handle user messages"""
             if not await self.check_user_access(message.from_user.id):
@@ -608,18 +611,6 @@ class YouTubeDownloaderBot:
                     await self.app.stop()
                 except:
                     pass
-
-
-@asynccontextmanager
-async def lifespan():
-    """Lifespan context manager for cleanup"""
-    bot = None
-    try:
-        bot = YouTubeDownloaderBot()
-        yield bot
-    finally:
-        if bot and bot.app:
-            await bot.app.stop()
 
 
 async def main():
