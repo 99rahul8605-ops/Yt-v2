@@ -8,6 +8,8 @@ import tempfile
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime
+from aiohttp import web
+import threading
 
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
@@ -32,6 +34,8 @@ class YouTubeDownloaderBot:
         self.cookies_available = False
         self.cookies_metadata = {}
         self.admin_ids = self.get_admin_ids()
+        self.web_app = None
+        self.runner = None
         
         # Initialize cookies
         self.check_cookies_file()
@@ -50,6 +54,7 @@ class YouTubeDownloaderBot:
             'admin_users': os.getenv('ADMIN_USERS', '').split(',') if os.getenv('ADMIN_USERS') else [],
             'max_concurrent': int(os.getenv('MAX_CONCURRENT_DOWNLOADS', '1')),
             'temp_dir': os.getenv('TEMP_DIR', '/tmp/ytdl'),
+            'port': int(os.getenv('PORT', '10000')),  # Render provides PORT
         }
         
         # Create directories
@@ -61,6 +66,7 @@ class YouTubeDownloaderBot:
             raise ValueError("Missing required Telegram configuration. Check TELEGRAM_API_ID, TELEGRAM_API_HASH, and TELEGRAM_BOT_TOKEN.")
             
         logger.info("Configuration loaded successfully")
+        logger.info(f"Web server will run on port: {config['port']}")
         return config
     
     def get_admin_ids(self) -> List[str]:
@@ -138,6 +144,127 @@ class YouTubeDownloaderBot:
             return len(domains)
         except:
             return 0
+    
+    async def start_web_server(self):
+        """Start a simple HTTP server for Render health checks"""
+        app = web.Application()
+        
+        # Health check endpoint
+        async def health_check(request):
+            return web.json_response({
+                'status': 'ok',
+                'service': 'youtube-downloader-bot',
+                'cookies_available': self.cookies_available,
+                'active_downloads': len(self.active_downloads),
+                'user_states': len(self.user_states),
+                'timestamp': datetime.now().isoformat()
+            })
+        
+        # Status endpoint
+        async def status(request):
+            try:
+                import psutil
+                import platform
+                
+                status_info = {
+                    'status': 'running',
+                    'bot': 'Telegram YouTube Downloader',
+                    'system': f"{platform.system()} {platform.release()}",
+                    'cpu_percent': psutil.cpu_percent(),
+                    'memory_percent': psutil.virtual_memory().percent,
+                    'disk_percent': psutil.disk_usage('/').percent,
+                    'active_downloads': len(self.active_downloads),
+                    'user_states': len(self.user_states),
+                    'cookies_available': self.cookies_available,
+                    'cookies_size': self.cookies_metadata.get('size', 0),
+                    'temp_dir': self.config['temp_dir'],
+                    'timestamp': datetime.now().isoformat()
+                }
+                return web.json_response(status_info)
+            except Exception as e:
+                return web.json_response({'status': 'error', 'message': str(e)}, status=500)
+        
+        # Root endpoint
+        async def root(request):
+            html = """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>YouTube Downloader Telegram Bot</title>
+                <style>
+                    body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; line-height: 1.6; }
+                    .container { background: #f5f5f5; padding: 30px; border-radius: 10px; margin-top: 20px; }
+                    .status { padding: 15px; border-radius: 5px; margin: 10px 0; }
+                    .status-ok { background: #d4edda; color: #155724; }
+                    .status-error { background: #f8d7da; color: #721c24; }
+                    .endpoints { background: #fff; padding: 20px; border-radius: 5px; margin-top: 20px; }
+                    code { background: #eee; padding: 2px 5px; border-radius: 3px; }
+                </style>
+            </head>
+            <body>
+                <h1>🎬 YouTube Downloader Telegram Bot</h1>
+                <p>This is a Telegram bot that downloads YouTube videos and sends them to users.</p>
+                
+                <div class="container">
+                    <h2>📊 Bot Status</h2>
+                    <div class="status" id="status">Loading status...</div>
+                    
+                    <h2>🔗 Endpoints</h2>
+                    <div class="endpoints">
+                        <p><strong>Health Check:</strong> <code><a href="/health">/health</a></code></p>
+                        <p><strong>Status:</strong> <code><a href="/status">/status</a></code></p>
+                        <p><strong>Home:</strong> <code><a href="/">/</a></code></p>
+                    </div>
+                    
+                    <h2>📱 How to Use</h2>
+                    <p>1. Find the bot on Telegram: <code>@YourBotUsername</code></p>
+                    <p>2. Send <code>/start</code> to begin</p>
+                    <p>3. Use <code>/yt</code> to download videos</p>
+                    
+                    <h2>⚙️ Configuration</h2>
+                    <p><strong>Cookies:</strong> <span id="cookies-status">Checking...</span></p>
+                    <p><strong>Port:</strong> <code id="port">Loading...</code></p>
+                </div>
+                
+                <script>
+                    async function updateStatus() {
+                        try {
+                            const response = await fetch('/health');
+                            const data = await response.json();
+                            document.getElementById('status').innerHTML = 
+                                `<div class="status-ok">✅ Bot is running (Active downloads: ${data.active_downloads})</div>`;
+                            document.getElementById('cookies-status').textContent = 
+                                data.cookies_available ? '✅ Available' : '❌ Not configured';
+                            document.getElementById('port').textContent = window.location.port || '10000';
+                        } catch (error) {
+                            document.getElementById('status').innerHTML = 
+                                `<div class="status-error">❌ Error: ${error.message}</div>`;
+                        }
+                    }
+                    
+                    updateStatus();
+                    setInterval(updateStatus, 30000); // Update every 30 seconds
+                </script>
+            </body>
+            </html>
+            """
+            return web.Response(text=html, content_type='text/html')
+        
+        # Add routes
+        app.router.add_get('/', root)
+        app.router.add_get('/health', health_check)
+        app.router.add_get('/status', status)
+        
+        # Start server
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', self.config['port'])
+        await site.start()
+        
+        logger.info(f"🌐 Web server started on port {self.config['port']}")
+        self.runner = runner
+        
+        return runner
     
     async def check_user_access(self, user_id: int) -> bool:
         """Check if user is allowed to use bot"""
@@ -271,7 +398,8 @@ class YouTubeDownloaderBot:
                     f"**Disk:** {disk.percent}% used\n"
                     f"**Active Downloads:** {len(self.active_downloads)}\n"
                     f"**Cookies:** {'✅ Available' if self.cookies_available else '❌ Not configured'}\n"
-                    f"**Temp Directory:** {self.config['temp_dir']}\n\n"
+                    f"**Temp Directory:** {self.config['temp_dir']}\n"
+                    f"**Web Server:** ✅ Running on port {self.config['port']}\n\n"
                     "✅ Bot is running normally"
                 )
                 
@@ -809,15 +937,21 @@ class YouTubeDownloaderBot:
                 logger.error(f"Error cleaning user files: {e}")
     
     async def run(self):
-        """Main entry point"""
+        """Main entry point - runs both web server and Telegram bot"""
         try:
+            # Start web server first (for Render health checks)
+            logger.info("Starting web server...")
+            await self.start_web_server()
+            
+            # Start Telegram bot
+            logger.info("Starting Telegram bot...")
             me = await self.start_client()
             
-            # Keep the bot running
-            logger.info(f"🤖 Bot is running as @{me.username}")
+            # Keep both running
+            logger.info(f"✅ Bot is running! Telegram: @{me.username}, Web: http://0.0.0.0:{self.config['port']}")
             logger.info("Press Ctrl+C to stop.")
             
-            # Wait for messages
+            # Run forever
             await idle()
             
         except KeyboardInterrupt:
@@ -825,9 +959,16 @@ class YouTubeDownloaderBot:
         except Exception as e:
             logger.error(f"Fatal error: {e}", exc_info=True)
         finally:
+            # Cleanup web server
+            if self.runner:
+                await self.runner.cleanup()
+                logger.info("Web server stopped")
+            
+            # Cleanup Telegram client
             if self.app:
                 try:
                     await self.app.stop()
+                    logger.info("Telegram bot stopped")
                 except:
                     pass
 
