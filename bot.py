@@ -34,6 +34,7 @@ class YouTubeDownloaderBot:
         self.cookies_metadata = {}
         self.admin_ids = self.get_admin_ids()
         self.runner = None
+        self.cookie_upload_states = {}  # Track cookie upload states
         
         # Initialize cookies
         self.check_cookies_file()
@@ -52,7 +53,7 @@ class YouTubeDownloaderBot:
             'admin_users': os.getenv('ADMIN_USERS', '').split(',') if os.getenv('ADMIN_USERS') else [],
             'max_concurrent': int(os.getenv('MAX_CONCURRENT_DOWNLOADS', '1')),
             'temp_dir': os.getenv('TEMP_DIR', '/tmp/ytdl'),
-            'port': int(os.getenv('PORT', '10000')),  # Render provides PORT
+            'port': int(os.getenv('PORT', '10000')),
         }
         
         # Create directories
@@ -142,6 +143,63 @@ class YouTubeDownloaderBot:
             return len(domains)
         except:
             return 0
+    
+    def validate_cookies_file(self, filepath: str) -> Tuple[bool, str]:
+        """Validate if file is a valid cookies.txt file"""
+        try:
+            if not os.path.exists(filepath):
+                return False, "File does not exist"
+            
+            file_size = os.path.getsize(filepath)
+            if file_size < 100:
+                return False, f"File too small ({file_size} bytes). Minimum 100 bytes required."
+            
+            if file_size > 1024 * 1024:  # 1MB
+                return False, f"File too large ({file_size} bytes). Maximum 1MB allowed."
+            
+            # Check if it looks like a cookies.txt file
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                first_line = f.readline().strip()
+                lines = f.readlines()[:10]
+                
+            # Check for Netscape format header
+            is_netscape = first_line.startswith('# Netscape HTTP Cookie File')
+            
+            # Check for valid cookie lines
+            cookie_lines = 0
+            for line in lines:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    parts = line.split('\t')
+                    if len(parts) >= 7:
+                        cookie_lines += 1
+            
+            if cookie_lines == 0 and not is_netscape:
+                return False, "File doesn't appear to be a valid cookies.txt format"
+            
+            # Check for YouTube domain
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+                if '.youtube.com' not in content and 'youtube.com' not in content:
+                    return False, "No YouTube cookies found in file"
+            
+            return True, f"Valid cookies file. Size: {file_size} bytes, Format: {'Netscape' if is_netscape else 'Unknown'}, Cookie lines: {cookie_lines}"
+            
+        except Exception as e:
+            return False, f"Error validating file: {str(e)}"
+    
+    def backup_current_cookies(self):
+        """Backup current cookies file"""
+        if os.path.exists(self.config['cookies_path']):
+            try:
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                backup_path = os.path.join(self.config['cookies_backup_dir'], f'cookies_backup_{timestamp}.txt')
+                shutil.copy2(self.config['cookies_path'], backup_path)
+                logger.info(f"Backed up cookies to: {backup_path}")
+                return backup_path
+            except Exception as e:
+                logger.error(f"Failed to backup cookies: {e}")
+        return None
     
     async def start_web_server(self):
         """Start a simple HTTP server for Render health checks"""
@@ -313,7 +371,6 @@ class YouTubeDownloaderBot:
                     "• /cookies_info - View detailed cookies info\n"
                     "• /cookies_upload - Upload new cookies file\n"
                     "• /cookies_backup - Backup current cookies\n"
-                    "• /cookies_restore - Restore from backup\n"
                     "• /cookies_test - Test cookies with YouTube\n"
                     "• /cookies_delete - Delete cookies file\n"
                 )
@@ -428,26 +485,260 @@ class YouTubeDownloaderBot:
             
             await message.reply(cookies_text)
         
+        # ========== COOKIE UPLOAD COMMANDS ==========
+        
+        @self.app.on_message(filters.command("cookies_upload"))
+        async def cookies_upload_command(client, message: Message):
+            """Start cookies upload process (Admin only)"""
+            if not await self.check_admin_access(message.from_user.id):
+                await message.reply("❌ Admin access required for this command.")
+                return
+            
+            user_id = message.from_user.id
+            self.cookie_upload_states[user_id] = "waiting_for_file"
+            
+            await message.reply(
+                "📤 **Upload Cookies File**\n\n"
+                "Please send me the `cookies.txt` file.\n\n"
+                "**Instructions:**\n"
+                "1. Export cookies from your browser using 'Get cookies.txt LOCALLY' extension\n"
+                "2. Send the `cookies.txt` file to this chat\n\n"
+                "**Requirements:**\n"
+                "• File must be named `cookies.txt` or have .txt extension\n"
+                "• Minimum size: 100 bytes\n"
+                "• Maximum size: 1MB\n"
+                "• Must contain YouTube cookies\n\n"
+                "Send /cancel to abort the upload."
+            )
+        
+        @self.app.on_message(filters.command("cookies_backup"))
+        async def cookies_backup_command(client, message: Message):
+            """Backup current cookies (Admin only)"""
+            if not await self.check_admin_access(message.from_user.id):
+                await message.reply("❌ Admin access required for this command.")
+                return
+            
+            if not self.cookies_available:
+                await message.reply("❌ No cookies file to backup.")
+                return
+            
+            try:
+                backup_path = self.backup_current_cookies()
+                if backup_path:
+                    await message.reply(
+                        f"✅ **Cookies Backup Created**\n\n"
+                        f"**Backup Location:** `{backup_path}`\n\n"
+                        "Cookies have been backed up successfully."
+                    )
+                else:
+                    await message.reply("❌ Failed to create backup.")
+                    
+            except Exception as e:
+                logger.error(f"Error creating backup: {e}")
+                await message.reply(f"❌ Error creating backup: {str(e)[:200]}")
+        
+        @self.app.on_message(filters.command("cookies_test"))
+        async def cookies_test_command(client, message: Message):
+            """Test cookies with YouTube (Admin only)"""
+            if not await self.check_admin_access(message.from_user.id):
+                await message.reply("❌ Admin access required for this command.")
+                return
+            
+            if not self.cookies_available:
+                await message.reply("❌ No cookies file to test.")
+                return
+            
+            status_msg = await message.reply("🔄 Testing cookies with YouTube...")
+            
+            try:
+                # Test with a simple YouTube request
+                test_url = "https://www.youtube.com/"
+                
+                ydl_opts = {
+                    'quiet': True,
+                    'no_warnings': True,
+                    'extract_flat': True,
+                    'cookiefile': self.config['cookies_path'],
+                    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                }
+                
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(test_url, download=False)
+                    
+                    if info:
+                        await status_msg.edit_text(
+                            "✅ **Cookies Test Successful!**\n\n"
+                            "Your cookies are working correctly with YouTube.\n\n"
+                            "**Details:**\n"
+                            f"• Cookies file: {self.config['cookies_path']}\n"
+                            f"• File size: {self.cookies_metadata.get('size', 0)} bytes\n\n"
+                            "Age-restricted videos should now work."
+                        )
+                    else:
+                        await status_msg.edit_text(
+                            "⚠️ **Cookies Test Inconclusive**\n\n"
+                            "Could not retrieve YouTube information.\n"
+                            "This doesn't necessarily mean cookies are invalid.\n\n"
+                            "Try downloading a video to test functionality."
+                        )
+                        
+            except Exception as e:
+                error_msg = str(e).lower()
+                await status_msg.edit_text(
+                    f"❌ **Cookies Test Failed**\n\n"
+                    f"**Error:** {str(e)[:200]}\n\n"
+                    "**Possible Issues:**\n"
+                    "1. Cookies file is expired\n"
+                    "2. Cookies don't have YouTube domain\n"
+                    "3. YouTube is blocking the request\n"
+                    "4. File format is invalid\n\n"
+                    "Try uploading a fresh cookies file."
+                )
+        
+        @self.app.on_message(filters.command("cookies_info"))
+        async def cookies_info_command(client, message: Message):
+            """Detailed cookies information (Admin only)"""
+            if not await self.check_admin_access(message.from_user.id):
+                await message.reply("❌ Admin access required for this command.")
+                return
+            
+            if not self.cookies_available:
+                await message.reply("❌ No cookies file found.")
+                return
+            
+            try:
+                # Read sample of cookies
+                sample_lines = []
+                with open(self.config['cookies_path'], 'r', encoding='utf-8', errors='ignore') as f:
+                    for i, line in enumerate(f):
+                        if i < 10:  # First 10 lines
+                            sample_lines.append(line.rstrip())
+                        else:
+                            break
+                
+                info_text = (
+                    "🍪 **Detailed Cookies Information**\n\n"
+                    f"**Path:** `{self.config['cookies_path']}`\n"
+                    f"**Size:** {self.cookies_metadata.get('size', 0)} bytes\n"
+                    f"**Modified:** {self.cookies_metadata.get('modified', 'Unknown')}\n"
+                    f"**Format:** {self.cookies_metadata.get('format', 'Unknown')}\n"
+                    f"**Total Lines:** {self.cookies_metadata.get('line_count', 0)}\n"
+                    f"**Unique Domains:** {self.cookies_metadata.get('domain_count', 0)}\n\n"
+                    "**Sample Lines:**\n"
+                )
+                
+                for i, line in enumerate(sample_lines, 1):
+                    info_text += f"{i}. `{line[:50]}{'...' if len(line) > 50 else ''}`\n"
+                
+                await message.reply(info_text[:4000])  # Telegram limit
+                
+            except Exception as e:
+                logger.error(f"Error reading cookies info: {e}")
+                await message.reply(f"❌ Error reading cookies file: {str(e)[:200]}")
+        
+        @self.app.on_message(filters.command("cookies_delete"))
+        async def cookies_delete_command(client, message: Message):
+            """Delete cookies file (Admin only)"""
+            if not await self.check_admin_access(message.from_user.id):
+                await message.reply("❌ Admin access required for this command.")
+                return
+            
+            if not self.cookies_available:
+                await message.reply("❌ No cookies file to delete.")
+                return
+            
+            # Create confirmation buttons
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("✅ Yes, delete cookies", callback_data="delete_cookies_yes")],
+                    [InlineKeyboardButton("❌ No, keep cookies", callback_data="delete_cookies_no")]
+                ]
+            )
+            
+            await message.reply(
+                "⚠️ **Delete Cookies File?**\n\n"
+                f"**File:** `{self.config['cookies_path']}`\n"
+                f"**Size:** {self.cookies_metadata.get('size', 0)} bytes\n"
+                f"**Last Modified:** {self.cookies_metadata.get('modified', 'Unknown')}\n\n"
+                "**Warning:** This will remove all cookies.\n"
+                "Age-restricted videos will stop working.\n\n"
+                "Are you sure you want to delete the cookies file?",
+                reply_markup=keyboard
+            )
+        
+        @self.app.on_callback_query()
+        async def handle_callback_query(client, callback_query):
+            """Handle callback queries for cookies deletion"""
+            user_id = callback_query.from_user.id
+            
+            if not await self.check_admin_access(user_id):
+                await callback_query.answer("Admin access required.", show_alert=True)
+                return
+            
+            if callback_query.data == "delete_cookies_yes":
+                try:
+                    # Backup first
+                    self.backup_current_cookies()
+                    
+                    # Delete cookies file
+                    if os.path.exists(self.config['cookies_path']):
+                        os.remove(self.config['cookies_path'])
+                        self.cookies_available = False
+                        self.cookies_metadata = {}
+                        
+                        await callback_query.message.edit_text(
+                            "✅ **Cookies Deleted Successfully**\n\n"
+                            "The cookies file has been removed.\n\n"
+                            "**Note:**\n"
+                            "• Age-restricted videos will no longer work\n"
+                            "• A backup was created before deletion\n"
+                            "• Use /cookies_upload to add new cookies"
+                        )
+                    else:
+                        await callback_query.message.edit_text("❌ Cookies file not found.")
+                        
+                except Exception as e:
+                    await callback_query.message.edit_text(f"❌ Error deleting cookies: {str(e)[:200]}")
+                    
+            elif callback_query.data == "delete_cookies_no":
+                await callback_query.message.edit_text("✅ Cookies deletion cancelled.")
+            
+            await callback_query.answer()
+        
         @self.app.on_message(filters.command("cancel"))
         async def cancel_command(client, message: Message):
             """Cancel current operation"""
             user_id = message.from_user.id
+            
             if user_id in self.user_states:
                 del self.user_states[user_id]
                 await message.reply("❌ Operation cancelled.")
+            
+            if user_id in self.cookie_upload_states:
+                del self.cookie_upload_states[user_id]
+                await message.reply("❌ Cookies upload cancelled.")
         
-        # FIXED: Use custom filter instead of ~filters.command
+        # Handle document messages (for cookies upload)
+        @self.app.on_message(filters.document)
+        async def handle_document(client, message: Message):
+            """Handle document uploads (for cookies.txt)"""
+            user_id = message.from_user.id
+            
+            # Check if user is in cookie upload state
+            if user_id in self.cookie_upload_states:
+                if self.cookie_upload_states[user_id] == "waiting_for_file":
+                    await self.handle_cookies_upload(message)
+        
+        # Handle text messages
         @self.app.on_message(filters.text)
-        async def handle_all_text_messages(client, message: Message):
-            """Handle all text messages"""
+        async def handle_text_messages(client, message: Message):
+            """Handle text messages"""
             user_id = message.from_user.id
             text = message.text.strip()
             
             # Skip if it's a command
             if text.startswith('/'):
                 return
-            
-            logger.info(f"Received text from user {user_id}: {text[:50]}...")
             
             # Check if user is waiting for URL
             if user_id in self.user_states:
@@ -473,7 +764,6 @@ class YouTubeDownloaderBot:
             
             # If not waiting for URL and text looks like a YouTube URL, suggest using /yt
             if self.validate_youtube_url(text):
-                logger.info(f"User {user_id} sent YouTube URL but not in waiting state")
                 await message.reply(
                     "🔗 **I see you sent a YouTube URL!**\n\n"
                     "To download videos, please use the /yt command first:\n"
@@ -481,6 +771,85 @@ class YouTubeDownloaderBot:
                     "2. Then send the URL\n\n"
                     "This helps me keep track of your request."
                 )
+    
+    async def handle_cookies_upload(self, message: Message):
+        """Handle cookies.txt file upload"""
+        user_id = message.from_user.id
+        
+        # Check if document is valid
+        document = message.document
+        if not document:
+            await message.reply("❌ Please send a file, not text.")
+            del self.cookie_upload_states[user_id]
+            return
+        
+        # Check file name
+        file_name = document.file_name.lower()
+        if not (file_name == 'cookies.txt' or file_name.endswith('.txt')):
+            await message.reply("❌ File must be a .txt file, preferably named 'cookies.txt'")
+            del self.cookie_upload_states[user_id]
+            return
+        
+        # Check file size
+        if document.file_size > 1024 * 1024:  # 1MB
+            await message.reply("❌ File too large. Maximum size is 1MB.")
+            del self.cookie_upload_states[user_id]
+            return
+        
+        if document.file_size < 100:
+            await message.reply("❌ File too small. Minimum size is 100 bytes.")
+            del self.cookie_upload_states[user_id]
+            return
+        
+        status_msg = await message.reply("📥 Downloading cookies file...")
+        
+        try:
+            # Download the file
+            temp_dir = tempfile.mkdtemp()
+            temp_path = os.path.join(temp_dir, "cookies_temp.txt")
+            
+            await message.download(temp_path)
+            
+            # Validate the file
+            is_valid, validation_msg = self.validate_cookies_file(temp_path)
+            
+            if not is_valid:
+                await status_msg.edit_text(f"❌ Invalid cookies file:\n\n{validation_msg}")
+                shutil.rmtree(temp_dir)
+                del self.cookie_upload_states[user_id]
+                return
+            
+            # Backup current cookies
+            self.backup_current_cookies()
+            
+            # Replace current cookies
+            shutil.copy2(temp_path, self.config['cookies_path'])
+            
+            # Update cookies metadata
+            self.check_cookies_file()
+            
+            # Cleanup
+            shutil.rmtree(temp_dir)
+            del self.cookie_upload_states[user_id]
+            
+            await status_msg.edit_text(
+                f"✅ **Cookies Updated Successfully!**\n\n"
+                f"{validation_msg}\n\n"
+                f"**New File:** `{self.config['cookies_path']}`\n"
+                f"**Size:** {self.cookies_metadata.get('size', 0)} bytes\n"
+                f"**YouTube Cookies:** {self.cookies_metadata.get('domain_count', 0)} domains\n\n"
+                "✅ Age-restricted videos should now work."
+            )
+            
+        except Exception as e:
+            logger.error(f"Error handling cookies upload: {e}")
+            await status_msg.edit_text(f"❌ Error uploading cookies: {str(e)[:200]}")
+            if 'temp_dir' in locals():
+                try:
+                    shutil.rmtree(temp_dir)
+                except:
+                    pass
+            del self.cookie_upload_states[user_id]
     
     def validate_youtube_url(self, url: str) -> bool:
         """Validate YouTube URL with improved patterns"""
@@ -491,33 +860,23 @@ class YouTubeDownloaderBot:
         url = url.replace('"', '').replace("'", "")
         
         patterns = [
-            # Standard watch URLs
             r'(?:https?://)?(?:www\.)?youtube\.com/watch\?(?:.*&)?v=[\w-]+',
-            # Short URLs
             r'(?:https?://)?youtu\.be/[\w-]+',
-            # Shorts URLs
             r'(?:https?://)?(?:www\.)?youtube\.com/shorts/[\w-]+',
-            # Playlist URLs
             r'(?:https?://)?(?:www\.)?youtube\.com/playlist\?list=[\w-]+',
-            # Embed URLs
             r'(?:https?://)?(?:www\.)?youtube\.com/embed/[\w-]+',
-            # Mobile URLs
             r'(?:https?://)?m\.youtube\.com/watch\?v=[\w-]+',
-            # With additional parameters
             r'(?:https?://)?(?:www\.)?youtube\.com/watch\?[\w=&%-]+v=[\w-]+[\w=&%-]*',
         ]
         
         for pattern in patterns:
             if re.match(pattern, url, re.IGNORECASE):
-                logger.info(f"URL matched pattern: {pattern}")
                 return True
         
         # Also check if it contains youtube.com or youtu.be even if pattern didn't match exactly
         if 'youtube.com' in url.lower() or 'youtu.be' in url.lower():
-            logger.info(f"URL contains youtube domain: {url}")
             return True
         
-        logger.warning(f"URL validation failed for: {url}")
         return False
     
     async def process_video(self, message: Message, url: str):
