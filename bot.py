@@ -25,7 +25,6 @@ class YouTubeDownloaderBot:
         self.config = self.load_config()
         self.app = None
         self.user_states = {}
-        self.temp_dir = None
         self.active_downloads = {}
         
     def load_config(self) -> Dict[str, Any]:
@@ -176,10 +175,14 @@ class YouTubeDownloaderBot:
                 del self.user_states[user_id]
                 await message.reply("❌ Operation cancelled.")
         
-        # FIXED: Added parentheses to filters.command()
-        @self.app.on_message(filters.text & ~filters.command())
-        async def handle_message(client, message: Message):
-            """Handle user messages"""
+        # Handle text messages (non-commands)
+        @self.app.on_message(filters.text)
+        async def handle_text_messages(client, message: Message):
+            """Handle text messages that aren't commands"""
+            # Skip if it's a command
+            if message.text and message.text.startswith('/'):
+                return
+                
             if not await self.check_user_access(message.from_user.id):
                 return
             
@@ -488,7 +491,7 @@ class YouTubeDownloaderBot:
             duration = float(probe['format']['duration'])
             frame_time = min(10, duration / 4)
             
-            # FIXED: Changed qscale:v=2 to qscale_v=2
+            # Use qscale_v instead of qscale:v
             ffmpeg.input(video_path, ss=frame_time)\
                   .output(thumbnail_path, vframes=1, qscale_v=2)\
                   .run(quiet=True, overwrite_output=True, capture_stdout=True, capture_stderr=True)
