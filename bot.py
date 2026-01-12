@@ -1,5 +1,3 @@
-[file name]: bot.py
-[file content begin]
 import os
 import asyncio
 import re
@@ -402,7 +400,7 @@ class YouTubeDownloaderBot:
                 "• Age-restricted videos require cookies\n\n"
                 "**📖 Usage:**\n"
                 "1. Send /yt\n"
-                "2. Reply with a YouTube URL"
+                "2. Then send the URL"
             )
         
         @self.app.on_message(filters.command("yt"))
@@ -1370,4 +1368,3 @@ if __name__ == "__main__":
         print("\nBot stopped by user")
     except Exception as e:
         print(f"Fatal error: {e}")
-[file content end]
